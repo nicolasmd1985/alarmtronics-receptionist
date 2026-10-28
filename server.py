@@ -532,12 +532,12 @@ async def handle_media_stream(websocket: WebSocket):
 
         async with gemini_client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=live_config) as live_ws:
             # Task B: Continuous multi-turn receiver loop from Gemini Live
-            async def receive_from_gemini():
+            async def receive_from_gemini(s: CallSession):
                 try:
-                    while not session.is_closing:
+                    while not s.is_closing:
                         try:
                             async for response in live_ws.receive():
-                                if session and session.is_closing:
+                                if s.is_closing:
                                     break
 
                                 content = response.server_content
@@ -547,47 +547,47 @@ async def handle_media_stream(websocket: WebSocket):
                                 # Handle native interruption (Barge-In)
                                 if content.interrupted:
                                     logger.info("[BARGE-IN] Interruption detected by Gemini. Clearing audio buffer.")
-                                    session.assistant_speaking = False
-                                    while not session.audio_out_queue.empty():
+                                    s.assistant_speaking = False
+                                    while not s.audio_out_queue.empty():
                                         try:
-                                            session.audio_out_queue.get_nowait()
+                                            s.audio_out_queue.get_nowait()
                                         except asyncio.QueueEmpty:
                                             break
                                     clear_msg = {
                                         "event": "clear",
-                                        "stream_id": session.stream_id,
-                                        "streamSid": session.stream_id,
+                                        "stream_id": s.stream_id,
+                                        "streamSid": s.stream_id,
                                     }
                                     await websocket.send_text(json.dumps(clear_msg))
 
                                 # Capture live transcription
                                 if content.input_transcription and content.input_transcription.text:
                                     text = content.input_transcription.text
-                                    session.current_user_text.append(text)
+                                    s.current_user_text.append(text)
 
                                 if content.output_transcription and content.output_transcription.text:
                                     text = content.output_transcription.text
-                                    session.current_model_text.append(text)
+                                    s.current_model_text.append(text)
 
                                 if content.turn_complete:
-                                    session.assistant_speaking = False
-                                    if session.current_user_text:
-                                        user_full = "".join(session.current_user_text).strip()
+                                    s.assistant_speaking = False
+                                    if s.current_user_text:
+                                        user_full = "".join(s.current_user_text).strip()
                                         if user_full:
                                             logger.info(f"[CALLER SPEECH]: {user_full}")
-                                            session.dialogue_history.append({"role": "caller", "content": user_full})
-                                        session.current_user_text.clear()
+                                            s.dialogue_history.append({"role": "caller", "content": user_full})
+                                        s.current_user_text.clear()
 
-                                    if session.current_model_text:
-                                        model_full = "".join(session.current_model_text).strip()
+                                    if s.current_model_text:
+                                        model_full = "".join(s.current_model_text).strip()
                                         if model_full:
                                             logger.info(f"[ASSISTANT SPEECH]: {model_full}")
-                                            session.dialogue_history.append({"role": "assistant", "content": model_full})
-                                        session.current_model_text.clear()
+                                            s.dialogue_history.append({"role": "assistant", "content": model_full})
+                                        s.current_model_text.clear()
 
                                 # Process streaming audio output from Gemini
                                 if content.model_turn and content.model_turn.parts:
-                                    session.assistant_speaking = True
+                                    s.assistant_speaking = True
                                     for part in content.model_turn.parts:
                                         if part.inline_data and part.inline_data.data:
                                             raw_24k = part.inline_data.data
@@ -596,12 +596,12 @@ async def handle_media_stream(websocket: WebSocket):
                                             samples_8k = resample_24k_to_8k(samples_24k)
                                             # Encode to G.711 mu-law bytes
                                             ulaw_bytes = pcm16_to_ulaw(samples_8k)
-                                            await session.audio_out_queue.put(ulaw_bytes)
+                                            await s.audio_out_queue.put(ulaw_bytes)
 
                         except asyncio.CancelledError:
                             break
                         except Exception as e:
-                            if session and session.is_closing:
+                            if s.is_closing:
                                 break
                             logger.warning(f"[GEMINI TURN CYCLE]: {e}")
                             await asyncio.sleep(0.05)
@@ -610,14 +610,12 @@ async def handle_media_stream(websocket: WebSocket):
                 except Exception as e:
                     logger.error(f"[GEMINI RECEIVE ERROR] {e}", exc_info=True)
 
-            receiver_task = asyncio.create_task(receive_from_gemini())
-
             # Task C: Real-Time Audio Pusher to Gemini Live
-            async def gemini_audio_pusher():
+            async def gemini_audio_pusher(s: CallSession):
                 try:
-                    while not session.is_closing:
-                        chunk = await session.inbound_audio_queue.get()
-                        if chunk is None or session.is_closing:
+                    while not s.is_closing:
+                        chunk = await s.inbound_audio_queue.get()
+                        if chunk is None or s.is_closing:
                             break
                         await live_ws.send_realtime_input(
                             audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
@@ -649,9 +647,10 @@ async def handle_media_stream(websocket: WebSocket):
                     session = CallSession(stream_id, call_sid, caller_phone, websocket)
                     logger.info(f"[TELNYX] Stream started: {stream_id} for Call SID: {call_sid}")
 
-                    # Launch audio sender and pusher tasks
+                    # Launch audio sender, receiver, and pusher tasks
                     sender_task = asyncio.create_task(audio_sender_loop(session))
-                    pusher_task = asyncio.create_task(gemini_audio_pusher())
+                    receiver_task = asyncio.create_task(receive_from_gemini(session))
+                    pusher_task = asyncio.create_task(gemini_audio_pusher(session))
 
                     # Queue pre-rendered greeting audio for instant zero-latency playback
                     if GREETING_ULAW:
