@@ -463,6 +463,7 @@ class CallSession:
         self.start_time = time.time()
         self.is_closing = False
         self.greeting_active = True
+        self.assistant_speaking = False
         self.audio_out_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self.inbound_audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self.dialogue_history: List[Dict[str, str]] = []
@@ -530,68 +531,80 @@ async def handle_media_stream(websocket: WebSocket):
         )
 
         async with gemini_client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=live_config) as live_ws:
-            # Task B: Receive from Gemini Live and feed audio_out_queue
+            # Task B: Continuous multi-turn receiver loop from Gemini Live
             async def receive_from_gemini():
                 try:
-                    async for response in live_ws.receive():
-                        if session and session.is_closing:
-                            break
-
-                        content = response.server_content
-                        if not content:
-                            continue
-
-                        # Handle native interruption (Barge-In)
-                        if content.interrupted:
-                            logger.info("[BARGE-IN] Interruption detected by Gemini. Clearing audio buffer.")
-                            while not session.audio_out_queue.empty():
-                                try:
-                                    session.audio_out_queue.get_nowait()
-                                except asyncio.QueueEmpty:
+                    while not session.is_closing:
+                        try:
+                            async for response in live_ws.receive():
+                                if session and session.is_closing:
                                     break
-                            clear_msg = {
-                                "event": "clear",
-                                "stream_id": session.stream_id,
-                                "streamSid": session.stream_id,
-                            }
-                            await websocket.send_text(json.dumps(clear_msg))
 
-                        # Capture live transcription
-                        if content.input_transcription and content.input_transcription.text:
-                            text = content.input_transcription.text
-                            session.current_user_text.append(text)
+                                content = response.server_content
+                                if not content:
+                                    continue
 
-                        if content.output_transcription and content.output_transcription.text:
-                            text = content.output_transcription.text
-                            session.current_model_text.append(text)
+                                # Handle native interruption (Barge-In)
+                                if content.interrupted:
+                                    logger.info("[BARGE-IN] Interruption detected by Gemini. Clearing audio buffer.")
+                                    session.assistant_speaking = False
+                                    while not session.audio_out_queue.empty():
+                                        try:
+                                            session.audio_out_queue.get_nowait()
+                                        except asyncio.QueueEmpty:
+                                            break
+                                    clear_msg = {
+                                        "event": "clear",
+                                        "stream_id": session.stream_id,
+                                        "streamSid": session.stream_id,
+                                    }
+                                    await websocket.send_text(json.dumps(clear_msg))
 
-                        if content.turn_complete:
-                            if session.current_user_text:
-                                user_full = "".join(session.current_user_text).strip()
-                                if user_full:
-                                    logger.info(f"[CALLER SPEECH]: {user_full}")
-                                    session.dialogue_history.append({"role": "caller", "content": user_full})
-                                session.current_user_text.clear()
+                                # Capture live transcription
+                                if content.input_transcription and content.input_transcription.text:
+                                    text = content.input_transcription.text
+                                    session.current_user_text.append(text)
 
-                            if session.current_model_text:
-                                model_full = "".join(session.current_model_text).strip()
-                                if model_full:
-                                    logger.info(f"[ASSISTANT SPEECH]: {model_full}")
-                                    session.dialogue_history.append({"role": "assistant", "content": model_full})
-                                session.current_model_text.clear()
+                                if content.output_transcription and content.output_transcription.text:
+                                    text = content.output_transcription.text
+                                    session.current_model_text.append(text)
 
-                        # Process streaming audio output from Gemini
-                        if content.model_turn and content.model_turn.parts:
-                            for part in content.model_turn.parts:
-                                if part.inline_data and part.inline_data.data:
-                                    raw_24k = part.inline_data.data
-                                    samples_24k = np.frombuffer(raw_24k, dtype=np.int16)
-                                    # Resample 24kHz to 8000Hz (exact 3:1 decimation)
-                                    samples_8k = resample_24k_to_8k(samples_24k)
-                                    # Encode to G.711 mu-law bytes
-                                    ulaw_bytes = pcm16_to_ulaw(samples_8k)
-                                    await session.audio_out_queue.put(ulaw_bytes)
+                                if content.turn_complete:
+                                    session.assistant_speaking = False
+                                    if session.current_user_text:
+                                        user_full = "".join(session.current_user_text).strip()
+                                        if user_full:
+                                            logger.info(f"[CALLER SPEECH]: {user_full}")
+                                            session.dialogue_history.append({"role": "caller", "content": user_full})
+                                        session.current_user_text.clear()
 
+                                    if session.current_model_text:
+                                        model_full = "".join(session.current_model_text).strip()
+                                        if model_full:
+                                            logger.info(f"[ASSISTANT SPEECH]: {model_full}")
+                                            session.dialogue_history.append({"role": "assistant", "content": model_full})
+                                        session.current_model_text.clear()
+
+                                # Process streaming audio output from Gemini
+                                if content.model_turn and content.model_turn.parts:
+                                    session.assistant_speaking = True
+                                    for part in content.model_turn.parts:
+                                        if part.inline_data and part.inline_data.data:
+                                            raw_24k = part.inline_data.data
+                                            samples_24k = np.frombuffer(raw_24k, dtype=np.int16)
+                                            # Resample 24kHz to 8000Hz (exact 3:1 decimation)
+                                            samples_8k = resample_24k_to_8k(samples_24k)
+                                            # Encode to G.711 mu-law bytes
+                                            ulaw_bytes = pcm16_to_ulaw(samples_8k)
+                                            await session.audio_out_queue.put(ulaw_bytes)
+
+                        except asyncio.CancelledError:
+                            break
+                        except Exception as e:
+                            if session and session.is_closing:
+                                break
+                            logger.warning(f"[GEMINI TURN CYCLE]: {e}")
+                            await asyncio.sleep(0.05)
                 except asyncio.CancelledError:
                     pass
                 except Exception as e:
@@ -599,7 +612,7 @@ async def handle_media_stream(websocket: WebSocket):
 
             receiver_task = asyncio.create_task(receive_from_gemini())
 
-            # Task C: Paced Audio Pusher to Gemini Live
+            # Task C: Real-Time Audio Pusher to Gemini Live
             async def gemini_audio_pusher():
                 try:
                     while not session.is_closing:
@@ -609,7 +622,6 @@ async def handle_media_stream(websocket: WebSocket):
                         await live_ws.send_realtime_input(
                             audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
                         )
-                        await asyncio.sleep(0.09)
                 except asyncio.CancelledError:
                     pass
                 except Exception as e:
@@ -684,6 +696,24 @@ async def handle_media_stream(websocket: WebSocket):
 
                     # If greeting finished, stream caller audio to Gemini
                     if not session.greeting_active:
+                        rms = np.sqrt(np.mean(pcm16_16k.astype(np.float64) ** 2))
+                        # Suppress acoustic speaker echo during assistant speech unless caller interrupts
+                        if session.assistant_speaking and rms < 900:
+                            continue
+                        elif session.assistant_speaking and rms >= 900:
+                            logger.info("[BARGE-IN] Caller voice detected during assistant speech.")
+                            session.assistant_speaking = False
+                            while not session.audio_out_queue.empty():
+                                try:
+                                    session.audio_out_queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
+                            await websocket.send_text(json.dumps({
+                                "event": "clear",
+                                "stream_id": session.stream_id,
+                                "streamSid": session.stream_id,
+                            }))
+
                         inbound_buffer.extend(pcm16_16k.tobytes())
                         # 100ms chunks (1600 samples = 3200 bytes)
                         if len(inbound_buffer) >= 3200:
