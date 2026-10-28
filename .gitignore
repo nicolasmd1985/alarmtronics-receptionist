@@ -1,0 +1,32 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment files with secrets
+.env
+.env.*
+!.env.example
+
+# Python byte code & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Database & local data logs
+data/*.db
+data/*.db-journal
+data/*.json
+
+# Model files & backups
+models/*.onnx
+models/*.json
+models/cache/
+*.bak
+
+# System & IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

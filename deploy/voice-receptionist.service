@@ -1,0 +1,16 @@
+[Unit]
+Description=AI Voice Receptionist FastAPI Server
+After=network.target
+
+[Service]
+Type=simple
+User=nicolas
+WorkingDirectory=/home/nicolas/Development/phones_alarmtronics
+EnvironmentFile=/home/nicolas/Development/phones_alarmtronics/.env
+ExecStart=/home/nicolas/Development/phones_alarmtronics/.venv/bin/python3 /home/nicolas/Development/phones_alarmtronics/server.py
+Restart=always
+RestartSec=3s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

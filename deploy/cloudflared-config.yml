@@ -1,0 +1,7 @@
+tunnel: db9e6de0-8e88-4603-8474-3197a49febb4
+credentials-file: /home/nicolas/.cloudflared/db9e6de0-8e88-4603-8474-3197a49febb4.json
+
+ingress:
+  - hostname: voz.nicolasmahecha.com
+    service: http://localhost:8000
+  - service: http_status:404

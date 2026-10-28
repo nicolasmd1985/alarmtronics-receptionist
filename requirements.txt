@@ -1,0 +1,11 @@
+# Production Dependencies for Alarmtronics Live AI Voice Receptionist
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+websockets>=13.0
+google-genai>=1.0.0
+scipy>=1.13.0
+numpy>=1.26.0
+pydantic>=2.9.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.12
+aiofiles>=24.1.0

@@ -1,0 +1,15 @@
+[Unit]
+Description=Cloudflare Tunnel Daemon for Voice Receptionist (voz.nicolasmahecha.com)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=nicolas
+ExecStart=/usr/local/bin/cloudflared tunnel --config /home/nicolas/.cloudflared/config.yml run voice-receptionist
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
