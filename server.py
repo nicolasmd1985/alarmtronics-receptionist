@@ -447,12 +447,24 @@ async def incoming_call_webhook(request: Request):
 class CallSession:
     def __init__(self, stream_id: str, call_sid: str, caller_phone: str, websocket: WebSocket):
         self.stream_id = stream_id
+GREETING_PATH = DATA_DIR / "greeting.ulaw"
+GREETING_ULAW = GREETING_PATH.read_bytes() if GREETING_PATH.exists() else b""
+OPENING_GREETING_TEXT = (
+    "Thank you for calling Alarmtronics. I am your virtual receptionist. "
+    "Could you please provide your name and tell me what issue you are experiencing with your alarm system today?"
+)
+
+class CallSession:
+    def __init__(self, stream_id: str, call_sid: str, caller_phone: str, websocket: WebSocket):
+        self.stream_id = stream_id
         self.call_sid = call_sid
         self.caller_phone = caller_phone
         self.websocket = websocket
         self.start_time = time.time()
         self.is_closing = False
+        self.greeting_active = True
         self.audio_out_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+        self.inbound_audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self.dialogue_history: List[Dict[str, str]] = []
         self.current_user_text: List[str] = []
         self.current_model_text: List[str] = []
@@ -463,14 +475,12 @@ async def handle_media_stream(websocket: WebSocket):
     logger.info("[WEBSOCKET] Client connected.")
 
     session: Optional[CallSession] = None
-    live_session = None
-
     if not gemini_client:
         logger.error("GenAI client not initialized. Cannot service call.")
         await websocket.close()
         return
 
-    # Dedicated sender loop that paces 20ms frames to Telnyx
+    # Task A: Dedicated sender loop that paces 20ms frames to Telnyx
     async def audio_sender_loop(s: CallSession):
         chunk_size = 160  # 20ms of 8kHz PCMU
         try:
@@ -502,9 +512,11 @@ async def handle_media_stream(websocket: WebSocket):
             pass
 
     sender_task: Optional[asyncio.Task] = None
+    pusher_task: Optional[asyncio.Task] = None
+    receiver_task: Optional[asyncio.Task] = None
 
     try:
-        # 1. Establish Gemini Live WebSocket Session
+        # Establish Gemini Live Session
         live_config = types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
             system_instruction=types.Content(parts=[types.Part(text=SYSTEM_PROMPT)]),
@@ -518,9 +530,7 @@ async def handle_media_stream(websocket: WebSocket):
         )
 
         async with gemini_client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=live_config) as live_ws:
-            live_session = live_ws
-
-            # Task 1: Receive from Gemini Live and feed audio_out_queue
+            # Task B: Receive from Gemini Live and feed audio_out_queue
             async def receive_from_gemini():
                 try:
                     async for response in live_ws.receive():
@@ -534,13 +544,11 @@ async def handle_media_stream(websocket: WebSocket):
                         # Handle native interruption (Barge-In)
                         if content.interrupted:
                             logger.info("[BARGE-IN] Interruption detected by Gemini. Clearing audio buffer.")
-                            # Flush local queue
                             while not session.audio_out_queue.empty():
                                 try:
                                     session.audio_out_queue.get_nowait()
                                 except asyncio.QueueEmpty:
                                     break
-                            # Clear carrier jitter buffer
                             clear_msg = {
                                 "event": "clear",
                                 "stream_id": session.stream_id,
@@ -572,7 +580,7 @@ async def handle_media_stream(websocket: WebSocket):
                                     session.dialogue_history.append({"role": "assistant", "content": model_full})
                                 session.current_model_text.clear()
 
-                        # Process streaming audio output
+                        # Process streaming audio output from Gemini
                         if content.model_turn and content.model_turn.parts:
                             for part in content.model_turn.parts:
                                 if part.inline_data and part.inline_data.data:
@@ -589,11 +597,28 @@ async def handle_media_stream(websocket: WebSocket):
                 except Exception as e:
                     logger.error(f"[GEMINI RECEIVE ERROR] {e}", exc_info=True)
 
-            gemini_receiver_task = asyncio.create_task(receive_from_gemini())
+            receiver_task = asyncio.create_task(receive_from_gemini())
 
-            # Task 2: Receive from Telnyx and feed Gemini Live session
+            # Task C: Paced Audio Pusher to Gemini Live
+            async def gemini_audio_pusher():
+                try:
+                    while not session.is_closing:
+                        chunk = await session.inbound_audio_queue.get()
+                        if chunk is None or session.is_closing:
+                            break
+                        await live_ws.send_realtime_input(
+                            audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
+                        )
+                        await asyncio.sleep(0.09)
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"[GEMINI PUSHER ERROR] {e}", exc_info=True)
+
             inbound_buffer = bytearray()
+            greeting_duration = (len(GREETING_ULAW) / 8000.0) if GREETING_ULAW else 3.0
 
+            # Main Loop: Receive from Telnyx WebSocket
             while True:
                 raw_msg = await websocket.receive_text()
                 data = json.loads(raw_msg)
@@ -612,15 +637,15 @@ async def handle_media_stream(websocket: WebSocket):
                     session = CallSession(stream_id, call_sid, caller_phone, websocket)
                     logger.info(f"[TELNYX] Stream started: {stream_id} for Call SID: {call_sid}")
 
-                    # Launch audio sender task
+                    # Launch audio sender and pusher tasks
                     sender_task = asyncio.create_task(audio_sender_loop(session))
+                    pusher_task = asyncio.create_task(gemini_audio_pusher())
 
-                    # Trigger opening greeting
-                    greeting_trigger = (
-                        "Call connected. Greet the caller warmly for Alarmtronics, "
-                        "introduce yourself as the virtual receptionist, and ask for their name and alarm issue."
-                    )
-                    await live_ws.send_realtime_input(text=greeting_trigger)
+                    # Queue pre-rendered greeting audio for instant zero-latency playback
+                    if GREETING_ULAW:
+                        await session.audio_out_queue.put(GREETING_ULAW)
+                        session.dialogue_history.append({"role": "assistant", "content": OPENING_GREETING_TEXT})
+                        logger.info(f"[ASSISTANT GREETING]: {OPENING_GREETING_TEXT}")
 
                 elif event == "media":
                     if not session:
@@ -631,27 +656,50 @@ async def handle_media_stream(websocket: WebSocket):
                     if not b64_payload:
                         continue
 
-                    # Decode mu-law to 8kHz PCM16, resample to 16kHz for Gemini
+                    # Decode mu-law to 8kHz PCM16, resample to 16kHz
                     ulaw_bytes = base64.b64decode(b64_payload)
                     pcm16_8k = ulaw_to_pcm16_8k(ulaw_bytes)
                     pcm16_16k = resample_8k_to_16k(pcm16_8k)
 
-                    inbound_buffer.extend(pcm16_16k.tobytes())
+                    # Check for barge-in or completion of greeting
+                    if session.greeting_active:
+                        elapsed = time.time() - session.start_time
+                        rms = np.sqrt(np.mean(pcm16_16k.astype(np.float64) ** 2))
+                        # Caller interruptions after 1.5s grace period
+                        if elapsed > 1.5 and rms > 950:
+                            logger.info("[BARGE-IN] Caller interrupted opening greeting.")
+                            session.greeting_active = False
+                            while not session.audio_out_queue.empty():
+                                try:
+                                    session.audio_out_queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
+                            await websocket.send_text(json.dumps({
+                                "event": "clear",
+                                "stream_id": session.stream_id,
+                                "streamSid": session.stream_id,
+                            }))
+                        elif elapsed >= greeting_duration:
+                            session.greeting_active = False
 
-                    # Send to Gemini in ~80ms blocks (1280 samples = 2560 bytes)
-                    if len(inbound_buffer) >= 2560:
-                        chunk_to_send = bytes(inbound_buffer[:2560])
-                        inbound_buffer = inbound_buffer[2560:]
-                        await live_ws.send_realtime_input(
-                            audio=types.Blob(data=chunk_to_send, mime_type="audio/pcm;rate=16000")
-                        )
+                    # If greeting finished, stream caller audio to Gemini
+                    if not session.greeting_active:
+                        inbound_buffer.extend(pcm16_16k.tobytes())
+                        # 100ms chunks (1600 samples = 3200 bytes)
+                        if len(inbound_buffer) >= 3200:
+                            chunk_to_send = bytes(inbound_buffer[:3200])
+                            inbound_buffer = inbound_buffer[3200:]
+                            await session.inbound_audio_queue.put(chunk_to_send)
 
                 elif event == "stop":
                     logger.info(f"[TELNYX] Stop event received for call {session.call_sid if session else 'UNKNOWN'}")
                     break
 
-            if gemini_receiver_task:
-                gemini_receiver_task.cancel()
+            if receiver_task:
+                receiver_task.cancel()
+            if pusher_task:
+                await session.inbound_audio_queue.put(None)
+                pusher_task.cancel()
 
     except WebSocketDisconnect:
         logger.info("[WEBSOCKET] Client disconnected.")

@@ -23,11 +23,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
+# Copy application files and pre-rendered audio
 COPY server.py .
-
-# Persistent storage mount point for SQLite database and audit logs
 RUN mkdir -p /app/data
+COPY data/greeting.ulaw /app/data/greeting.ulaw
 
 EXPOSE 8000
 
