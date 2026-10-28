@@ -1,15 +1,18 @@
-# RESUMEN DEL PROYECTO Y ROADMAP: RECEPCIONISTA VIRTUAL AI (ALARMTRONICS)
+# RESUMEN DEL PROYECTO Y ESTADO ACTUAL: RECEPCIONISTA VIRTUAL AI (ALARMTRONICS)
 
-**Fecha:** 27 de Octubre, 2026  
-**Línea Telefónica Activa:** `+1-407-305-0475` (Telnyx - Florida Central)  
-**Dominio / Webhook Ingress:** `https://voz.nicolasmahecha.com`  
+**Fecha de Actualización:** 28 de Octubre, 2026  
+**Línea Telefónica Activa:** `+1 (407) 305-0475` (Telnyx TeXML - Florida Central)  
+**Dominio Público / Webhook:** `https://voz.nicolasmahecha.com`  
+**WebSocket Media Stream:** `wss://voz.nicolasmahecha.com/media-stream`  
 **Empresa:** Alarmtronics (Sistemas de Alarma Contra Incendios y Seguridad/Intrusión)  
+**Repositorio GitHub:** `https://github.com/nicolasmd1985/alarmtronics-receptionist.git`  
+**Docker Hub Image:** `nicolasmd/alarmtronics-receptionist:latest`  
 
 ---
 
-## 1. Resumen de lo Construido Hoy
+## 1. Arquitectura Actual en Producción (Opción B: Gemini Live API)
 
-Se diseñó, programó y puso en producción un sistema telefónico con Inteligencia Artificial autónoma que atiende llamadas de la red telefónica pública (PSTN) en tiempo real, interactúa de forma conversacional con el cliente en inglés, extrae los datos del incidente de alarma y guarda un ticket estructurado para el técnico de servicio.
+El sistema opera con **Google Gemini Live API (`gemini-3.1-flash-live-preview`)**, procesando voz a voz bidireccional en tiempo real con una latencia promedio de **~1.2 segundos** y voz neural de alta fidelidad (`Aoede`).
 
 ### Diagrama del Flujo en Tiempo Real
 
@@ -21,123 +24,126 @@ Se diseñó, programó y puso en producción un sistema telefónico con Intelige
                │ Webhook HTTP POST (/incoming-call)
                ▼
 [ Cloudflare Tunnel: voz.nicolasmahecha.com ]
-               │ Redirección segura a localhost:8000
+               │ Redirección segura a 127.0.0.1:8000
                ▼
-[ Servidor FastAPI / WebSocket: /media-stream ]
+[ Contenedor Docker: alarmtronics-receptionist ]
                │
-               ├──> 1. Inbound Audio PCMU 8kHz
-               ├──> 2. Decodificación G.711 µ-law & Resampling a 16kHz
-               ├──> 3. VAD (Detección de voz/silencio por RMS Energy)
-               ├──> 4. faster-whisper (Transcripción STT en ~300ms en CPU)
-               ├──> 5. Google Gemini (gemini-flash-lite-latest en ~0.6s)
-               ├──> 6. Piper TTS (Síntesis de voz neural en ~100ms)
-               └──> 7. Outbound Audio PCMU 8kHz streaming full-duplex con Barge-In
+               ├──> 1. Saludo Instantáneo (data/greeting.ulaw - 0ms latencia)
+               ├──> 2. Decodificación ITU-T G.711 µ-law y Resampling a 16kHz
+               ├──> 3. Supresión de Eco Acústico del Altavoz (RMS > 900 para Barge-In)
+               ├──> 4. Google Gemini Live API (gemini-3.1-flash-live-preview)
+               │       - Transcripción de entrada (caller transcription)
+               │       - Generación directa de audio PCM 24kHz
+               │       - Bucle multi-turno continuo (receive_from_gemini)
+               ├──> 5. Decimación exacta 3:1 (24kHz -> 8000Hz) & Codificación µ-law
+               └──> 6. Transmisión RTP a Telnyx en paquetes de 20ms (160 bytes)
                │
 [ Al colgar la llamada ]
                │
-               └──> Gemini analiza la transcripción completa y guarda el ticket
-                    en SQLite (data/leads.db) y JSON (data/leads.json)
+               └──> Gemini Flash Lite analiza la transcripción completa
+                    y guarda el ticket estructurado en SQLite (data/leads.db)
+                    y auditoría JSON (data/leads.json)
 ```
 
 ---
 
-## 2. Problemas Técnicos Superados Hoy
+## 2. Hitos y Problemas Resueltos Hoy
 
-1. **Python 3.14 (PEP 594 - Eliminación de `audioop`):**
-   - En Python 3.13+, la librería nativa `audioop` ya no existe.
-   - *Solución:* Se programaron tablas de búsqueda NumPy $O(1)$ precalculadas para codificación y decodificación ITU-T G.711 $\mu$-law, logrando rendimiento C sin dependencias externas.
+### A. Migración Exitosa a Gemini Live Multimodal
+- Se reemplazó la cadena tradicional (Whisper STT + Gemini Flash + Piper TTS) por la API nativa de voz **Gemini Live**, eliminando desfasajes fonéticos y permitiendo interacción fluida de voz natural con la voz neural `Aoede`.
 
-2. **Telefonía Telnyx ("Wireless mobile is not available"):**
-   - El número estaba asignado inicialmente a un SIP Trunk.
-   - *Solución:* Se creó una aplicación TeXML en el portal de Telnyx vinculada al número telefónico y apuntando a `https://voz.nicolasmahecha.com/incoming-call`.
+### B. Saludo Pre-renderizado sin Colisión de WebSockets
+- Se generó el archivo de audio telefónico nativo `data/greeting.ulaw` (73,004 bytes = 9.13s de audio limpio PCMU a 8kHz).
+- Esto evita enviar comandos de texto iniciales al socket en vivo mientras el micrófono telefónico transmite ruido ambiental, eliminando el error `1011 keepalive ping timeout`.
 
-3. **Dominio e Ingress Seguro sin Tocar la Web Actual:**
-   - El dominio `nicolasmahecha.com` tenía su sitio web principal activo.
-   - *Solución:* Se configuró Cloudflare Tunnel (`cloudflared`) mapeando exclusivamente el subdominio `voz.nicolasmahecha.com` hacia `localhost:8000`, preservando intactos todos los registros A, MX y de correo de la página web existente.
+### C. Resolución del Bug Multi-Turno (Silencio tras el Turno 1)
+- **Causa Raíz 1:** En el SDK `google-genai`, el generador `live_ws.receive()` ejecuta un `break` automático al finalizar cada turno (`turn_complete=True`). Al no tener un bucle exterior, la tarea receptora moría al terminar la primera respuesta. Se implementó un bucle persistente `while not s.is_closing: async for response in live_ws.receive(): ...` que atiende infinitos turnos sin desconectarse.
+- **Causa Raíz 2:** Se eliminó el `await asyncio.sleep(0.09)` del emisor de audio (`gemini_audio_pusher`), evitando acumulación de colas y retrasos acumulativos.
+- **Causa Raíz 3:** Se corrigió la inicialización de tareas asociándolas a la instancia `session` recién creada tras el evento `event: "start"` de Telnyx, eliminando el fallo `AttributeError: 'NoneType' object has no attribute 'is_closing'`.
 
-4. **Latencia en CPU Intel Core i5-4210U (2 cores / 4 threads):**
-   - El modelo Whisper `base` demoraba 25 segundos por turno en CPU.
-   - *Solución:* Se integró `faster-whisper` modelo `tiny` con cuantización `int8`, reduciendo la transcripción a solo **~300ms**. Se utilizó `Piper TTS` en local (ONNX runtime), logrando sintetizar audio en **~100ms** con cero costo de nube.
+### D. Supresión de Eco Acústico y Soporte para Interrupciones (Barge-In)
+- Se programó un filtro de umbral RMS (900): si el asistente está hablando y el usuario no interrumpe con voz fuerte, el retorno del altavoz al micrófono es suprimido para no generar eco ni auto-interrupciones en Gemini. Si el usuario habla con energía, se limpia el buffer y el modelo se interrumpe inmediatamente.
 
-5. **Resolución Definitiva del Bucle / Loop y Error 503:**
-   - La API de Gemini arrojaba `503 Service Unavailable (high demand)` en modelos pesados, activando un mensaje por defecto genérico que hacía parecer que el bot olvidaba la conversación.
-   - *Solución:*
-     - Se migró a **`gemini-flash-lite-latest`**, logrando respuestas en **0.66 segundos** de forma 100% estable.
-     - Se actualizó el saludo inicial para pedir Nombre y Problema de entrada:
-       > *"Thank you for calling Alarmtronics. I am your virtual receptionist. Could you please provide your name and tell me what issue you are experiencing with your alarm system today?"*
-     - Se implementó un **Fallback Determinístico Anti-Bucle**: si Gemini o la red fallaran, el bot analiza qué información ya proporcionó el cliente (Nombre/Problema $\rightarrow$ Dirección $\rightarrow$ Teléfono $\rightarrow$ Confirmación) y nunca repite una pregunta ya contestada.
-     - Se añadió `turn_lock` asíncrono para evitar procesamiento concurrente desordenado ante pausas breves al hablar.
-     - Se eliminó el `initial_prompt` de Whisper y se agregó un filtro de limpieza de alucinaciones repetitivas.
+### E. Contenedorización Completa con Docker
+- **Dockerfile:** Imagen optimizada en `python:3.12-slim` (~250MB) con dependencias mínimas requeridas.
+- **docker-compose.yml:** Servicio `voice-receptionist` mapeando `127.0.0.1:8000:8000`, montando volumen persistente `./data:/app/data` y con healthcheck automático sobre `/health`.
+- Se configuró con política de reinicio `unless-stopped` para ejecución **24/7**.
+
+### F. Automatización CI/CD con GitHub Actions
+- Archivo de flujo de trabajo `.github/workflows/deploy.yml` idéntico al estándar del servidor de `nicolasmahecha.com`.
+- Pasos automatizados:
+  1. Compilación de imagen Docker con Docker Buildx y push a Docker Hub (`nicolasmd/alarmtronics-receptionist:latest`).
+  2. Conexión segura por SSH al servidor.
+  3. Generación automática del archivo `.env.production` a partir de los Secrets de GitHub (`GEMINI_API_KEY`, `TELNYX_PHONE_NUMBER`, etc.).
+  4. Despliegue con `docker compose pull` y `docker compose up -d`.
 
 ---
 
-## 3. Estructura de Archivos del Proyecto
+## 3. Verificación de la Última Prueba Real en Vivo
+
+En la llamada de prueba realizada por el usuario al `+1 (407) 305-0475`:
+- **Cliente:** Julian
+- **Problema Reportado:** No puede desarmar el sistema y la sirena sigue sonando activa.
+- **Dirección de Servicio:** 8011 Michigan Avenue, Kissimmee, Florida.
+- **Teléfono de Retorno:** 407-312-1222.
+- **Turnos Totales:** 7 turnos fluidos con confirmación de despacho.
+- **Resultado en Base de Datos (SQLite & JSON):** Ticket guardado con ID #26, clasificado como `urgency: emergency` y resumen generado con éxito.
+
+---
+
+## 4. Estructura de Archivos del Repositorio
 
 ```
 /home/nicolas/Development/phones_alarmtronics/
-├── .env                              # Credenciales (Gemini API Key, modelo, puertos, teléfono)
-├── server.py                         # Servidor principal FastAPI, WebSockets, STT, LLM, TTS, DB
-├── download_models.py                # Script de descarga de voces Piper (EN / ES)
-├── test_call_simulation.py           # Simulador local de llamadas telefónicas por WebSockets
-├── requirements.txt                  # Dependencias de Python
-├── data/
-│   ├── leads.db                      # Base de datos SQLite con tickets de servicio
-│   └── leads.json                    # Registro histórico en formato JSON
-├── models/
-│   ├── en_US-lessac-medium.onnx      # Modelo de voz neural en inglés
-│   ├── en_US-lessac-medium.onnx.json # Configuración de voz en inglés
-│   ├── es_ES-davefx-medium.onnx      # Modelo de voz neural en español
-│   └── es_ES-davefx-medium.onnx.json # Configuración de voz en español
-└── deploy/
-    ├── cloudflared-config.yml        # Configuración del túnel de Cloudflare
-    ├── cloudflared-receptionist.service # Servicio systemd para el túnel
-    └── voice-receptionist.service    # Servicio systemd para el servidor FastAPI
+├── .env                              # Variables locales de entorno
+├── .env.example                      # Plantilla de variables para CI/CD
+├── .gitignore                        # Reglas de exclusión de Git
+├── Dockerfile                        # Imagen Docker en python:3.12-slim
+├── docker-compose.yml                # Orquestación de contenedor y volumen de datos
+├── requirements.txt                  # Dependencias de Python mínimas
+├── server.py                         # Servidor principal FastAPI / WebSockets / Gemini Live
+├── RESUMEN_PROYECTO_Y_ROADMAP.md     # Documento de contexto y estado actual
+├── .github/
+│   └── workflows/
+│       └── deploy.yml                # Pipeline CI/CD GitHub Actions
+└── data/
+    ├── greeting.ulaw                 # Audio pre-renderizado del saludo en PCMU 8kHz
+    ├── leads.db                      # Base de datos SQLite persistente con tickets
+    └── leads.json                    # Registro cronológico en formato JSON
 ```
 
 ---
 
-## 4. Guía Rápida de Comandos para Mañana
+## 5. Guía de Comandos Rápidos para Mañana
 
-### Verificar que todo esté funcionando
+### Verificar que el contenedor esté corriendo y saludable
 ```bash
-# 1. Probar el endpoint de salud público
-curl -s https://voz.nicolasmahecha.com/health
-
-# 2. Ver las llamadas y leads guardados en SQLite
-sqlite3 data/leads.db "SELECT id, caller_name, caller_phone, issue_description, service_address, created_at FROM leads ORDER BY id DESC LIMIT 5;"
+docker compose ps
+curl -s http://127.0.0.1:8000/health
 ```
 
-### Iniciar o reiniciar el servidor manualmente
+### Ver los logs en vivo de las llamadas telefónicas
 ```bash
-cd /home/nicolas/Development/phones_alarmtronics
-source .venv/bin/activate
-python3 server.py
+docker logs -f --tail 50 alarmtronics-receptionist
 ```
 
-### Probar una llamada simulada sin usar minutos de teléfono
+### Consultar los últimos tickets de servicio capturados
 ```bash
-source .venv/bin/activate
-python3 test_call_simulation.py
+sqlite3 data/leads.db "SELECT id, timestamp, caller_name, caller_phone, service_address, reason_for_call, urgency FROM leads ORDER BY id DESC LIMIT 5;"
 ```
 
-### Dejar los servicios corriendo en segundo plano automáticamente (Systemd)
-Si deseas que el recepcionista y el túnel arranquen solos al encender la PC:
+### Reiniciar o reconstruir el contenedor tras cambios en el código
 ```bash
-sudo cp deploy/cloudflared-receptionist.service /etc/systemd/system/
-sudo cp deploy/voice-receptionist.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now cloudflared-receptionist.service
-sudo systemctl enable --now voice-receptionist.service
+docker compose up -d --build
 ```
 
 ---
 
-## 5. Roadmap: Mejoras Propuestas para Mañana
+## 6. Próximos Pasos Sugeridos para Mañana
 
-| # | Mejora Propuesta | Beneficio |
-|---|-------------------|-----------|
-| **1** | **Notificaciones SMS / Email Instantáneas** | En cuanto el cliente cuelga y se guarda el lead, enviar un SMS o Email al técnico de turno con el resumen del problema, dirección y teléfono para devolución de llamada inmediata. |
-| **2** | **Dashboard Web de Control de Tickets** | Una interfaz web sencilla y elegante (ej. en `voz.nicolasmahecha.com/dashboard`) donde el personal de Alarmtronics pueda ver en vivo los tickets creados, reproducir el audio o leer la transcripción, marcar como "Atendido", y exportar a Excel. |
-| **3** | **Soporte Bilingüe Automático (Inglés / Español)** | Si el cliente responde en español ("Hola, mi alarma está sonando"), el sistema detecta el idioma en tiempo real y cambia a la voz en español de Piper (`es_ES-davefx-medium`), respondiendo de forma nativa en español. |
-| **4** | **Integración con Google Sheets / CRM** | Sincronización automática de cada fila de lead con una hoja compartida de Google Sheets o webhook hacia el software de despacho de Alarmtronics. |
-| **5** | **Optimización de Fonética para Códigos de Alarma** | Ajustar el prompt para reconocer marcas específicas (Honeywell, DSC, Ademco, Bosch, Silent Knight, Fire-Lite) y modelos de panel comunes. |
+1. **Notificación SMS / Email al Técnico:**
+   - Integrar envío inmediato de notificación (por webhook, Telnyx SMS o email SMTP/SendGrid) cada vez que se guarde un ticket con urgencia `urgent` o `emergency`.
+2. **Dashboard Web de Despacho:**
+   - Crear una interfaz web visual en `/leads` o `/dashboard` para que el equipo de despacho pueda ver tickets en tiempo real, filtrar por urgencia y marcarlos como "Despachado" o "Atendido".
+3. **Soporte Bilingüe Dinámico:**
+   - Aprovechar las capacidades nativas de Gemini 3.1 Flash Live para alternar fluidamente entre inglés y español si el cliente inicia la conversación en español.
