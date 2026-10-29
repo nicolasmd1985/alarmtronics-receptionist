@@ -93,13 +93,14 @@ jobs:
 
       - name: Ensure deploy directory exists on server
         run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} 'mkdir -p ~/alarmtronics-receptionist && chmod 755 ~/alarmtronics-receptionist'
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} 'mkdir -p ~/alarmtronics-receptionist/data && chmod 755 ~/alarmtronics-receptionist'
 
       - name: Copy files to production server
         run: |
           scp -o StrictHostKeyChecking=no .env.production ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:~/alarmtronics-receptionist/.env
           scp -o StrictHostKeyChecking=no docker-compose.yml ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:~/alarmtronics-receptionist/docker-compose.yml
           scp -o StrictHostKeyChecking=no deploy_script.sh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:~/alarmtronics-receptionist/deploy_script.sh
+          scp -o StrictHostKeyChecking=no data/greeting.ulaw ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:~/alarmtronics-receptionist/data/greeting.ulaw
 
       - name: Execute deployment on server
         uses: appleboy/ssh-action@v1.0.3

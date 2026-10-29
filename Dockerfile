@@ -27,6 +27,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY server.py .
 RUN mkdir -p /app/data
 COPY data/greeting.ulaw /app/data/greeting.ulaw
+COPY data/greeting.ulaw /app/greeting.ulaw
 
 EXPOSE 8000
 

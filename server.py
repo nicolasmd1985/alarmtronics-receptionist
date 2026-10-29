@@ -444,10 +444,12 @@ async def incoming_call_webhook(request: Request):
 # 5. Full-Duplex Bidirectional WebSocket Gateway (Telnyx <-> Gemini Live)
 # ==============================================================================
 
-class CallSession:
-    def __init__(self, stream_id: str, call_sid: str, caller_phone: str, websocket: WebSocket):
-        self.stream_id = stream_id
 GREETING_PATH = DATA_DIR / "greeting.ulaw"
+if not GREETING_PATH.exists():
+    fallback_greeting = BASE_DIR / "greeting.ulaw"
+    if fallback_greeting.exists():
+        GREETING_PATH = fallback_greeting
+
 GREETING_ULAW = GREETING_PATH.read_bytes() if GREETING_PATH.exists() else b""
 OPENING_GREETING_TEXT = (
     "Thank you for calling Alarmtronics. I am your virtual receptionist. "
