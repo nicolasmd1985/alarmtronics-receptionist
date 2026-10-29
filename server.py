@@ -137,7 +137,7 @@ def resample_24k_to_8k(pcm16_24k: np.ndarray) -> np.ndarray:
 # 2. Conversational Persona & System Instructions
 # ==============================================================================
 
-SYSTEM_PROMPT = f"""You are the professional and courteous voice receptionist for {COMPANY_NAME}, specializing in commercial and residential Fire Alarms and Burglar/Intrusion Security Alarms.
+SYSTEM_PROMPT = f"""You are the professional, friendly, and efficient voice receptionist for {COMPANY_NAME}, specializing in residential and commercial Fire Alarms and Burglar/Intrusion Security Alarms.
 
 Your primary goal is to collect 4 specific pieces of information from the caller, ONE STEP AT A TIME:
 1. Caller's Full Name
@@ -146,15 +146,18 @@ Your primary goal is to collect 4 specific pieces of information from the caller
 4. Callback Phone Number
 
 Conversational Rules:
-- Speak ONLY in plain English at all times.
-- Keep every answer natural, polite, and strictly under 20 words per response.
+- Speak ONLY in plain, natural English at all times.
+- Keep every answer natural, polite, and strictly under 25 words per response.
 - Ask for ONLY ONE missing item at a time. NEVER ask multiple questions in a single response.
 - Progression steps:
-  - Step 1: Once you know the Name and Issue -> ask for Service Address: "Got it, [Name]. What is the address of the property where the alarm is located?"
+  - Step 1: Once you know the Name and Issue -> ask for Service Address: "Got it, [Name]. What is the street address of the property where the alarm is located?"
   - Step 2: Once you have the Address -> ask for Callback Phone Number: "Thank you. And what is your best callback phone number?"
   - Step 3: If the caller provides their phone number first, acknowledge it and ask for the Service Address: "Got your number, thank you. What is the property service address?"
-  - Step 4: Once you have Name, Issue, Address, and Phone Number, conclude the call warmly:
-    "Thank you, [Name]. A technician has been dispatched for [Address] and will call you shortly. Have a great day!"
+  - Step 4 (Conclude and Hang Up): Once you have all 4 items (Name, Issue, Address, and Phone Number), wrap up the call professionally.
+    CRITICAL DISPATCH RULE: NEVER promise or say that a technician is dispatched immediately or is on the way now. Instead, explain that the Alarmtronics service supervisor has received the ticket and will review the details to coordinate the best available technician, and our office will follow up with them to schedule.
+    Conclude with this warm farewell:
+    "Thank you, [Name]. I have logged your service ticket for [Address]. Our service supervisor will review the details and contact you to coordinate a technician. Have a wonderful day, goodbye!"
+- Always end your final farewell message with "Have a wonderful day, goodbye!" so the call can conclude and hang up properly.
 - Emergency Safety Rule: If the caller reports an active fire, smoke, or physical danger, urge them immediately: "If you are in physical danger or there is an active fire, please hang up and call 911 immediately."
 - Never repeat questions already answered. Never repeat the initial greeting.
 """
@@ -436,6 +439,7 @@ async def incoming_call_webhook(request: Request):
             <Parameter name="call_sid" value="{call_sid}" />
         </Stream>
     </Connect>
+    <Hangup />
 </Response>
 """
     return Response(content=texml_response.strip(), media_type="application/xml")
@@ -466,6 +470,7 @@ class CallSession:
         self.is_closing = False
         self.greeting_active = True
         self.assistant_speaking = False
+        self.hangup_scheduled = False
         self.audio_out_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self.inbound_audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self.dialogue_history: List[Dict[str, str]] = []
@@ -513,6 +518,24 @@ async def handle_media_stream(websocket: WebSocket):
                     await asyncio.sleep(0.019)  # 20ms pacing cadence
         except asyncio.CancelledError:
             pass
+
+    async def schedule_hangup(s: CallSession):
+        if s.hangup_scheduled:
+            return
+        s.hangup_scheduled = True
+        try:
+            logger.info(f"[AUTO HANGUP] Scheduling automatic hangup for SID: {s.call_sid}...")
+            # Wait for all buffered audio to be dispatched to Telnyx
+            while not s.audio_out_queue.empty() and not s.is_closing:
+                await asyncio.sleep(0.15)
+            # Grace period for Telnyx/carrier audio playback to finish cleanly
+            await asyncio.sleep(2.5)
+            if not s.is_closing:
+                logger.info(f"[AUTO HANGUP] Goodbye audio finished. Terminating WebSocket stream for SID: {s.call_sid}.")
+                s.is_closing = True
+                await websocket.close(code=1000, reason="Call completed normally")
+        except Exception as e:
+            logger.warning(f"[AUTO HANGUP EXCEPTION]: {e}")
 
     sender_task: Optional[asyncio.Task] = None
     pusher_task: Optional[asyncio.Task] = None
@@ -585,6 +608,24 @@ async def handle_media_stream(websocket: WebSocket):
                                         if model_full:
                                             logger.info(f"[ASSISTANT SPEECH]: {model_full}")
                                             s.dialogue_history.append({"role": "assistant", "content": model_full})
+
+                                            # Automated call conclusion detection
+                                            goodbye_keywords = [
+                                                "goodbye",
+                                                "have a wonderful day",
+                                                "have a great day",
+                                                "have a good day",
+                                                "bye-bye",
+                                                "take care",
+                                                "supervisor will review",
+                                                "coordinate a technician",
+                                            ]
+                                            model_lower = model_full.lower()
+                                            caller_turns = [t for t in s.dialogue_history if t["role"] == "caller"]
+                                            if len(caller_turns) >= 2 and any(kw in model_lower for kw in goodbye_keywords):
+                                                logger.info(f"[AUTO HANGUP DETECTED] Assistant concluded call. Scheduling disconnect.")
+                                                asyncio.create_task(schedule_hangup(s))
+
                                         s.current_model_text.clear()
 
                                 # Process streaming audio output from Gemini
