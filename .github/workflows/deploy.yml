@@ -122,7 +122,15 @@ jobs:
           script: |
             cd ~/alarmtronics-receptionist
             docker compose ps
-            echo "Checking local health endpoint..."
+            echo "Checking health endpoint with retry loop..."
+            for i in $(seq 1 30); do
+              if curl -s -f http://127.0.0.1:8000/health > /dev/null; then
+                echo "Healthcheck passed on attempt $i!"
+                break
+              fi
+              echo "Waiting for container initialization... ($i/30)"
+              sleep 2
+            done
             curl -s -f http://127.0.0.1:8000/health || exit 1
             echo ""
             echo "Recent container logs:"
