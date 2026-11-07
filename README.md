@@ -178,12 +178,48 @@ Keep Namecheap BasicDNS as authoritative nameservers without changing them:
 
 ---
 
+## Call Forwarding & Operational Presets (+19043850726)
+
+The system supports hot-swapping between 3 operational modes in real time:
+
+1. **Modo 1: Desvío Directo Manual (`mode: direct`):**
+   - Incoming calls to `+1 (407) 305-0475` ring directly on Nicolas's phone (`+19043850726`).
+   - You answer manually. AI is completely bypassed and WebSockets are not connected.
+2. **Modo 2: IA Híbrida con Transferencia (`mode: ai_hybrid`):**
+   - The AI virtual receptionist answers automatically.
+   - **Solo si el cliente pide hablar con un humano o con Nicolas**, la IA anuncia una frase de cortesía y transfiere la llamada activa en vivo al `+19043850726`.
+   - Si no pide transferencia, la IA recopila los datos del cliente, guarda el ticket y concluye la llamada normalmente.
+3. **Modo 3: Solo IA Autónoma 100% (`mode: ai_only`):**
+   - La IA atiende el 100% de la llamada y registra toda la información en SQLite y JSON.
+   - **Transferencia estrictamente deshabilitada:** Aunque el cliente pida hablar con un humano, la IA le informa cortésmente que registrará todos sus datos para que el equipo lo contacte, sin transferir la llamada.
+
+### Control Options:
+1. **Web Dashboard:** Visita `https://voz.nicolasmahecha.com/` (o `http://localhost:8000/`) y usa los botones de modo rápido o los interruptores individuales.
+2. **Interactive Console Keyboard:**
+   - Presiona `f` + Enter $\rightarrow$ Alterna Desvío Directo Inmediato.
+   - Presiona `t` + Enter $\rightarrow$ Alterna Permisos de Transferencia IA (Permitida <-> Solo IA).
+   - Presiona `s` + Enter $\rightarrow$ Muestra el estado actual.
+3. **CLI Commands:**
+   ```bash
+   python3 server.py --status           # Ver estado actual
+   python3 server.py --mode direct      # Modo 1: Desvío Manual Directo
+   python3 server.py --mode ai_hybrid   # Modo 2: IA + Transferencia a Humano
+   python3 server.py --mode ai_only     # Modo 3: Solo IA (100% Autónoma)
+   python3 server.py --transfer-on      # Permitir transferencias por IA
+   python3 server.py --transfer-off     # Desactivar transferencias por IA (Solo IA)
+   ```
+
+---
+
 ## Endpoints Reference
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/` | Operational dashboard with live telemetry and diagnostics |
-| `GET` | `/health` | Health check probe (STT, TTS, LLM status) |
-| `POST` | `/incoming-call` | Telnyx TeXML Webhook dispatching `<Connect><Stream>` |
+| `GET` | `/` | Operational dashboard with live telemetry and visual forwarding toggle |
+| `GET` | `/health` | Health check probe (Gemini Live & Call Forwarding status) |
+| `GET` | `/forwarding` | Returns current forwarding config and status badge |
+| `POST` | `/forwarding/toggle` | Toggles call forwarding on/off in real time |
+| `POST` | `/incoming-call` | Telnyx Inbound Webhook (TeXML `<Dial>` if active, `<Connect><Stream>` if AI) |
+| `POST` | `/incoming-call-after-stream` | TeXML post-stream redirect (handles mid-call transfer or hangup) |
 | `WS` | `/media-stream` | Full-duplex Telnyx PCMU 8kHz audio WebSocket stream |
 | `GET` | `/leads` | JSON API returning all captured caller leads |
