@@ -1,149 +1,126 @@
 # RESUMEN DEL PROYECTO Y ESTADO ACTUAL: RECEPCIONISTA VIRTUAL AI (ALARMTRONICS)
 
-**Fecha de Actualización:** 28 de Octubre, 2026  
-**Línea Telefónica Activa:** `+1 (407) 305-0475` (Telnyx TeXML - Florida Central)  
-**Dominio Público / Webhook:** `https://voz.nicolasmahecha.com`  
+**Última Actualización:** 7 de Noviembre, 2026  
+**Línea Telefónica Activa (Telnyx):** `+1 (407) 305-0475` (Florida Central)  
+**Número Destino de Desvío / Transferencia (Nicolas):** `+1 (904) 385-0726`  
+**Dominio Público / Panel Web / Webhook:** `https://voz.nicolasmahecha.com`  
 **WebSocket Media Stream:** `wss://voz.nicolasmahecha.com/media-stream`  
+**Servidor de Producción (GCP):** `35.255.35.187` (usuario: `nicolasmelectronic`)  
 **Empresa:** Alarmtronics (Sistemas de Alarma Contra Incendios y Seguridad/Intrusión)  
 **Repositorio GitHub:** `https://github.com/nicolasmd1985/alarmtronics-receptionist.git`  
 **Docker Hub Image:** `nicolasmd/alarmtronics-receptionist:latest`  
 
 ---
 
-## 1. Arquitectura Actual en Producción (Opción B: Gemini Live API)
+## 1. Arquitectura Actual en Producción (Gemini Live API + Control de Desvío)
 
-El sistema opera con **Google Gemini Live API (`gemini-3.1-flash-live-preview`)**, procesando voz a voz bidireccional en tiempo real con una latencia promedio de **~1.2 segundos** y voz neural de alta fidelidad (`Aoede`).
+El sistema opera con **Google Gemini Live API (`gemini-3.1-flash-live-preview` sobre API `v1beta`)**, procesando voz a voz bidireccional en tiempo real con voz neural (`Aoede`) y gestionando 3 modos operativos intercambiables en caliente desde el panel web `https://voz.nicolasmahecha.com/`.
 
-### Diagrama del Flujo en Tiempo Real
+### Modos Operativos Disponibles
 
-```
-[ Cliente Llama: +1-407-305-0475 ]
-               │
-               ▼
-[ Carrier: Telnyx Programmable Voice (TeXML) ]
-               │ Webhook HTTP POST (/incoming-call)
-               ▼
-[ Cloudflare Tunnel: voz.nicolasmahecha.com ]
-               │ Redirección segura a 127.0.0.1:8000
-               ▼
-[ Contenedor Docker: alarmtronics-receptionist ]
-               │
-               ├──> 1. Saludo Instantáneo (data/greeting.ulaw - 0ms latencia)
-               ├──> 2. Decodificación ITU-T G.711 µ-law y Resampling a 16kHz
-               ├──> 3. Supresión de Eco Acústico del Altavoz (RMS > 900 para Barge-In)
-               ├──> 4. Google Gemini Live API (gemini-3.1-flash-live-preview)
-               │       - Transcripción de entrada (caller transcription)
-               │       - Generación directa de audio PCM 24kHz
-               │       - Bucle multi-turno continuo (receive_from_gemini)
-               ├──> 5. Decimación exacta 3:1 (24kHz -> 8000Hz) & Codificación µ-law
-               └──> 6. Transmisión RTP a Telnyx en paquetes de 20ms (160 bytes)
-               │
-[ Al colgar la llamada ]
-               │
-               └──> Gemini Flash Lite analiza la transcripción completa
-                    y guarda el ticket estructurado en SQLite (data/leads.db)
-                    y auditoría JSON (data/leads.json)
-```
+1. **Modo 3 — Solo IA Autónoma 100% (`ai_only`) [ACTIVO Y VERIFICADO EN VIVO]:**
+   - La recepcionista virtual IA atiende el 100% de la llamada entrante.
+   - Recopila paso a paso: Nombre completo, Problema de la alarma, Dirección de la propiedad y Teléfono de contacto.
+   - Despide cordialmente al cliente, cuelga automáticamente al concluir (`<Hangup />` / cierre de WebSocket) y guarda el ticket estructurado en SQLite (`data/leads.db`) y JSON (`data/leads.json`).
+   - **Sin transferencias:** Aunque el cliente pida hablar con un humano, la IA le explica cortésmente que registrará todos sus datos prioritarios para el supervisor sin transferir la llamada.
+
+2. **Modo 2 — IA Híbrida con Transferencia a Humano (`ai_hybrid`):**
+   - La IA contesta automáticamente la llamada.
+   - Si el cliente solicita hablar con Nicolas, soporte o un humano, la IA anuncia una frase de cortesía, invoca la herramienta `transfer_to_human`, cierra el stream y Telnyx ejecuta el callback `action` de `<Connect>` hacia `/incoming-call-after-stream` para enlazar la llamada mediante `<Dial callerId="+14073050475">` hacia `+19043850726`.
+
+3. **Modo 1 — Desvío Directo Manual (`direct`):**
+   - Toda llamada entrante al `+14073050475` puentea por completo la IA y responde inmediatamente con TeXML `<Dial callerId="+14073050475" timeout="25"><Number>+19043850726</Number></Dial>` para contestar manualmente en el teléfono `+19043850726`.
 
 ---
 
-## 2. Hitos y Problemas Resueltos Hoy
+## 2. Hitos, Diagnóstico y Problemas Resueltos (Actualización 7 de Noviembre, 2026)
 
-### A. Migración Exitosa a Gemini Live Multimodal
-- Se reemplazó la cadena tradicional (Whisper STT + Gemini Flash + Piper TTS) por la API nativa de voz **Gemini Live**, eliminando desfasajes fonéticos y permitiendo interacción fluida de voz natural con la voz neural `Aoede`.
+### A. Implementación de Estado Persistente y Panel de Control Web (`data/config.json`)
+- Se implementó persistencia atómica en `data/config.json` con los campos `call_forwarding_active`, `allow_human_transfer`, `forward_to_number` (`+19043850726`) y `updated_at`.
+- Se añadieron endpoints REST en `server.py`:
+  - `GET /forwarding`: Consulta del estado y modo operativo actual.
+  - `POST /forwarding/mode`: Selección directa de modo (`direct`, `ai_hybrid`, `ai_only`).
+  - `POST /forwarding/toggle`: Alternancia rápida de desvío directo.
+  - `POST /forwarding/toggle-transfer`: Alternancia del permiso de transferencia a humano por la IA.
+  - `POST /dial-status`: Webhook de diagnóstico para registrar el resultado (`DialCallStatus` y `DialSipResponseCode`) de cualquier `<Dial>` en Telnyx.
+  - `POST /incoming-call-after-stream`: Webhook post-stream para ejecutar la transferencia en caliente en modo híbrido.
+- Se actualizó el Dashboard en `https://voz.nicolasmahecha.com/` con botones de modo rápido e interruptores en tiempo real.
 
-### B. Saludo Pre-renderizado sin Colisión de WebSockets
-- Se generó el archivo de audio telefónico nativo `data/greeting.ulaw` (73,004 bytes = 9.13s de audio limpio PCMU a 8kHz).
-- Esto evita enviar comandos de texto iniciales al socket en vivo mientras el micrófono telefónico transmite ruido ambiental, eliminando el error `1011 keepalive ping timeout`.
+### B. Causa Raíz y Solución del Fallo `HTTP 404` en Gemini Live WebSocket
+- **Síntoma:** Al realizar llamadas tras los primeros despliegues del día, Telnyx colgaba inmediatamente al intentar conectar con la IA.
+- **Diagnóstico en el servidor GCP (`35.255.35.187`):** Al inspeccionar `docker logs alarmtronics-receptionist`, se detectó que al modificarse `requirements.txt` se invalidó la caché de Docker y se instaló `google-genai 3.0.0` (en lugar de `2.33.0`). En `google-genai 3.0.0`, el SDK cambió el `api_version` por defecto de `v1beta` a `v1`. Como el endpoint WebSocket `BidiGenerateContent` de Gemini Live solo existe en `v1beta`, Google rechazaba la conexión con `HTTP 404` en los primeros 30ms.
+- **Solución Aplicada:**
+  1. Se configuró explícitamente `http_options={"api_version": "v1beta"}` al inicializar `genai.Client` en `server.py`.
+  2. Se fijó `google-genai==2.33.0` en `requirements.txt`.
+  3. Se actualizó la extracción de `call_sid` en el evento `start` del WebSocket para leer `custom_parameters["call_sid"]`, garantizando trazabilidad completa del ID de llamada de Telnyx.
 
-### C. Resolución del Bug Multi-Turno (Silencio tras el Turno 1)
-- **Causa Raíz 1:** En el SDK `google-genai`, el generador `live_ws.receive()` ejecuta un `break` automático al finalizar cada turno (`turn_complete=True`). Al no tener un bucle exterior, la tarea receptora moría al terminar la primera respuesta. Se implementó un bucle persistente `while not s.is_closing: async for response in live_ws.receive(): ...` que atiende infinitos turnos sin desconectarse.
-- **Causa Raíz 2:** Se eliminó el `await asyncio.sleep(0.09)` del emisor de audio (`gemini_audio_pusher`), evitando acumulación de colas y retrasos acumulativos.
-- **Causa Raíz 3:** Se corrigió la inicialización de tareas asociándolas a la instancia `session` recién creada tras el evento `event: "start"` de Telnyx, eliminando el fallo `AttributeError: 'NoneType' object has no attribute 'is_closing'`.
-
-### D. Supresión de Eco Acústico y Soporte para Interrupciones (Barge-In)
-- Se programó un filtro de umbral RMS (900): si el asistente está hablando y el usuario no interrumpe con voz fuerte, el retorno del altavoz al micrófono es suprimido para no generar eco ni auto-interrupciones en Gemini. Si el usuario habla con energía, se limpia el buffer y el modelo se interrumpe inmediatamente.
-
-### E. Contenedorización Completa con Docker
-- **Dockerfile:** Imagen optimizada en `python:3.12-slim` (~250MB) con dependencias mínimas requeridas.
-- **docker-compose.yml:** Servicio `voice-receptionist` mapeando `127.0.0.1:8000:8000`, montando volumen persistente `./data:/app/data` y con healthcheck automático sobre `/health`.
-- Se configuró con política de reinicio `unless-stopped` para ejecución **24/7**.
-
-### F. Automatización CI/CD con GitHub Actions
-- Archivo de flujo de trabajo `.github/workflows/deploy.yml` idéntico al estándar del servidor de `nicolasmahecha.com`.
-- Pasos automatizados:
-  1. Compilación de imagen Docker con Docker Buildx y push a Docker Hub (`nicolasmd/alarmtronics-receptionist:latest`).
-  2. Conexión segura por SSH al servidor.
-  3. Generación automática del archivo `.env.production` a partir de los Secrets de GitHub (`GEMINI_API_KEY`, `TELNYX_PHONE_NUMBER`, etc.).
-  4. Despliegue con `docker compose pull` y `docker compose up -d`.
+### C. Corrección de Flujo TeXML para Solo IA, IA Híbrida y Desvío
+- **Modo Solo IA (`ai_only`):** Devuelve `<Connect><Stream .../></Connect><Hangup />` sin redirecciones intermedias y con `tools=None`.
+- **Modo IA Híbrida (`ai_hybrid`):** Utiliza el atributo nativo `<Connect action=".../incoming-call-after-stream" method="POST">` en lugar de un `<Redirect>` posterior a `<Connect>` (ya que en TeXML `<Stream>` es asíncrono y un `<Redirect>` hermano se ejecutaba prematuramente).
+- **Modo Desvío (`direct`):** Incluye explícitamente `callerId="+14073050475"` y `<Number>+19043850726</Number>` dentro de `<Dial>`.
 
 ---
 
-## 3. Verificación de la Última Prueba Real en Vivo
+## 3. Verificación de Llamadas Reales en Producción
 
-En la llamada de prueba realizada por el usuario al `+1 (407) 305-0475`:
-- **Cliente:** Julian
-- **Problema Reportado:** No puede desarmar el sistema y la sirena sigue sonando activa.
-- **Dirección de Servicio:** 8011 Michigan Avenue, Kissimmee, Florida.
-- **Teléfono de Retorno:** 407-312-1222.
-- **Turnos Totales:** 7 turnos fluidos con confirmación de despacho.
-- **Resultado en Base de Datos (SQLite & JSON):** Ticket guardado con ID #26, clasificado como `urgency: emergency` y resumen generado con éxito.
-
----
-
-## 4. Estructura de Archivos del Repositorio
-
-```
-/home/nicolas/Development/phones_alarmtronics/
-├── .env                              # Variables locales de entorno
-├── .env.example                      # Plantilla de variables para CI/CD
-├── .gitignore                        # Reglas de exclusión de Git
-├── Dockerfile                        # Imagen Docker en python:3.12-slim
-├── docker-compose.yml                # Orquestación de contenedor y volumen de datos
-├── requirements.txt                  # Dependencias de Python mínimas
-├── server.py                         # Servidor principal FastAPI / WebSockets / Gemini Live
-├── RESUMEN_PROYECTO_Y_ROADMAP.md     # Documento de contexto y estado actual
-├── .github/
-│   └── workflows/
-│       └── deploy.yml                # Pipeline CI/CD GitHub Actions
-└── data/
-    ├── greeting.ulaw                 # Audio pre-renderizado del saludo en PCMU 8kHz
-    ├── leads.db                      # Base de datos SQLite persistente con tickets
-    └── leads.json                    # Registro cronológico en formato JSON
-```
+### Prueba en Vivo — 7 de Noviembre, 2026 (18:03 UTC)
+- **Origen:** `+1 (689) 249-0957` (Nicolas) $\rightarrow$ `+1 (407) 305-0475`
+- **Modo Activo:** `Solo IA` (`ai_only`)
+- **Desarrollo de la Llamada:**
+  1. Recepción de saludo pre-renderizado instantáneo e interrupción natural (*Barge-In*) detectada correctamente.
+  2. Captura de nombre (`Nicolas`), problema (`alarm is dead`), dirección (`223 Orlando Avenue`) y teléfono de retorno.
+  3. Despedida automática de la IA y desconexión limpia tras 61.0 segundos y 9 turnos (`[AUTO HANGUP]`).
+  4. Extracción estructurada con `gemini-flash-lite-latest` (`HTTP 200 OK`) y almacenamiento en `/app/data/leads.db` y `/app/data/leads.json`.
 
 ---
 
-## 5. Guía de Comandos Rápidos para Mañana
+## 4. Guía para Continuar y Probar el Desvío de Llamadas (`+19043850726`)
 
-### Verificar que el contenedor esté corriendo y saludable
+Cuando retomes las pruebas para validar el **Modo Desvío Directo (`direct`)** y la **Transferencia en Modo Híbrido (`ai_hybrid`)**, sigue esta lista de verificación:
+
+### Paso 1: Verificar el "Outbound Voice Profile" en el Portal de Telnyx (Requisito de Carrier)
+Cuando Telnyx responde con `<Connect><Stream>`, solo recibe audio entrante y no requiere perfil saliente. Sin embargo, cuando Telnyx ejecuta `<Dial><Number>+19043850726</Number></Dial>`, Telnyx origina una **llamada saliente PSTN** nueva hacia `+19043850726`.
+1. Ingresa a **Telnyx Mission Control Portal** $\rightarrow$ **Voice** $\rightarrow$ **TeXML Applications**.
+2. Edita la aplicación asignada al número `+1-407-305-0475` (`Nicolas Receptionist Agent`).
+3. En la sección **Outbound** $\rightarrow$ **Outbound Voice Profile**, verifica que tenga seleccionado un **Outbound Voice Profile** activo (no `None`).
+4. En **Voice** $\rightarrow$ **Outbound Voice Profiles**, confirma que ese perfil tenga permitidas las llamadas salientes a **United States / North America (+1)**.
+
+### Paso 2: Probar el Modo Desvío Directo (`direct`)
+1. Abre `https://voz.nicolasmahecha.com/` y haz clic en el botón **1. Desvío Directo (Manual)** (o ejecuta `curl -X POST https://voz.nicolasmahecha.com/forwarding/mode -H "Content-Type: application/json" -d '{"mode":"direct"}'`).
+2. Llama al `+1 (407) 305-0475`.
+3. Revisa en tiempo real el resultado del `<Dial>` en el servidor GCP:
+   ```bash
+   ssh -i ~/.ssh/id_ed25519 nicolasmelectronic@35.255.35.187 docker logs -f --tail 30 alarmtronics-receptionist
+   ```
+   - Si el teléfono `+19043850726` timbra y contestas, verás `[DIAL STATUS CALLBACK] Status: completed`.
+   - Si Telnyx rechaza la llamada saliente por configuración de cuenta/perfil, el nuevo webhook `/dial-status` mostrará exactamente el código SIP (`SIP Code: 403 / D49 / etc.`) en `[DIAL STATUS CALLBACK]`.
+
+### Paso 3: Probar el Modo IA Híbrida (`ai_hybrid`)
+1. En `https://voz.nicolasmahecha.com/`, selecciona **2. IA + Transferir a Humano**.
+2. Llama al `+1 (407) 305-0475` y cuando la IA conteste, dile: *"Please transfer me to Nicolas"* o *"Can I speak to a human?"*.
+3. La IA anunciará la transferencia, cerrará el stream de voz y Telnyx ejecutará `/incoming-call-after-stream` marcando al `+19043850726`.
+
+---
+
+## 5. Comandos Rápidos de Operación y Mantenimiento
+
+### Ver logs en vivo en el servidor GCP
 ```bash
-docker compose ps
-curl -s http://127.0.0.1:8000/health
+ssh -i ~/.ssh/id_ed25519 nicolasmelectronic@35.255.35.187 docker logs -f --tail 50 alarmtronics-receptionist
 ```
 
-### Ver los logs en vivo de las llamadas telefónicas
+### Verificar estado de salud y modo activo
 ```bash
-docker logs -f --tail 50 alarmtronics-receptionist
+curl -s https://voz.nicolasmahecha.com/health
+curl -s https://voz.nicolasmahecha.com/forwarding
 ```
 
-### Consultar los últimos tickets de servicio capturados
+### Ejecutar la suite de pruebas automatizadas localmente
 ```bash
-sqlite3 data/leads.db "SELECT id, timestamp, caller_name, caller_phone, service_address, reason_for_call, urgency FROM leads ORDER BY id DESC LIMIT 5;"
+.venv/bin/python3 test_forwarding_and_endpoints.py
 ```
 
-### Reiniciar o reconstruir el contenedor tras cambios en el código
+### Desplegar cambios pendientes a GitHub / Docker Hub
 ```bash
-docker compose up -d --build
+git push origin main
 ```
-
----
-
-## 6. Próximos Pasos Sugeridos para Mañana
-
-1. **Notificación SMS / Email al Técnico:**
-   - Integrar envío inmediato de notificación (por webhook, Telnyx SMS o email SMTP/SendGrid) cada vez que se guarde un ticket con urgencia `urgent` o `emergency`.
-2. **Dashboard Web de Despacho:**
-   - Crear una interfaz web visual en `/leads` o `/dashboard` para que el equipo de despacho pueda ver tickets en tiempo real, filtrar por urgencia y marcarlos como "Despachado" o "Atendido".
-3. **Soporte Bilingüe Dinámico:**
-   - Aprovechar las capacidades nativas de Gemini 3.1 Flash Live para alternar fluidamente entre inglés y español si el cliente inicia la conversación en español.

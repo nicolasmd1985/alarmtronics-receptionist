@@ -1342,9 +1342,14 @@ async def handle_media_stream(websocket: WebSocket):
                 elif event == "start":
                     stream_id = data.get("stream_id") or data.get("streamSid") or data.get("start", {}).get("stream_id", "STR_DEFAULT")
                     start_meta = data.get("start", {})
-                    call_sid = start_meta.get("call_sid") or data.get("call_sid", "UNKNOWN_SID")
                     custom_params = start_meta.get("custom_parameters", {})
-                    caller_phone = custom_params.get("caller", "+1-Unknown")
+                    call_sid = (
+                        custom_params.get("call_sid")
+                        or start_meta.get("call_sid")
+                        or start_meta.get("call_control_id")
+                        or data.get("call_sid", "UNKNOWN_SID")
+                    )
+                    caller_phone = custom_params.get("caller") or start_meta.get("from", "+1-Unknown")
 
                     session = CallSession(stream_id, call_sid, caller_phone, websocket)
                     logger.info(f"[TELNYX] Stream started: {stream_id} for Call SID: {call_sid}")
