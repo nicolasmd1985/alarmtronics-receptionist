@@ -193,7 +193,10 @@ async def transfer_call_control_v2(call_control_id: str, target_phone: str) -> b
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        payload = {"to": target_phone}
+        payload = {
+            "to": target_phone,
+            "from": TELNYX_PHONE_NUMBER,
+        }
         async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.post(url, json=payload, headers=headers)
             if resp.status_code in (200, 202):
@@ -856,10 +859,12 @@ async def incoming_call_webhook(request: Request):
             asyncio.create_task(transfer_call_control_v2(call_control_id, target))
             return JSONResponse({"status": "forwarded", "to": target, "call_control_id": call_control_id})
 
-        # TeXML Dial response:
+        # TeXML Dial response (with authorized Caller ID and Number encapsulation):
         texml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Dial timeout="25">{target}</Dial>
+    <Dial callerId="{TELNYX_PHONE_NUMBER}" timeout="25">
+        <Number>{target}</Number>
+    </Dial>
 </Response>
 """
         return Response(content=texml_response.strip(), media_type="application/xml")
@@ -869,11 +874,26 @@ async def incoming_call_webhook(request: Request):
     scheme = "https" if "trycloudflare.com" in host or "voz." in host or request.url.scheme == "https" else request.url.scheme
     ws_scheme = "wss" if scheme == "https" else "ws"
     stream_url = f"{ws_scheme}://{host}/media-stream"
-    redirect_url = f"{scheme}://{host}/incoming-call-after-stream?call_sid={call_sid}&amp;caller={caller_from}"
 
-    logger.info(f"[INCOMING CALL -> AI] SID: {call_sid} | From: {caller_from} | Dispatching TeXML Stream to: {stream_url}")
+    allow_transfer = cfg.get("allow_human_transfer", True)
+    logger.info(f"[INCOMING CALL -> AI] SID: {call_sid} | From: {caller_from} | Allow Transfer: {allow_transfer} | Stream: {stream_url}")
 
-    texml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+    if allow_transfer:
+        # AI Hybrid Mode: Stream to AI with action hook on <Connect> so terminating stream on transfer triggers Dial to Nicolas
+        action_url = f"{scheme}://{host}/incoming-call-after-stream?call_sid={call_sid}"
+        texml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect action="{action_url}" method="POST">
+        <Stream url="{stream_url}" bidirectionalMode="rtp" bidirectionalCodec="PCMU">
+            <Parameter name="caller" value="{caller_from}" />
+            <Parameter name="call_sid" value="{call_sid}" />
+        </Stream>
+    </Connect>
+</Response>
+"""
+    else:
+        # Solo IA (100% Autonomous Mode): Pure stream then hang up cleanly, never transfers
+        texml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
         <Stream url="{stream_url}" bidirectionalMode="rtp" bidirectionalCodec="PCMU">
@@ -881,7 +901,7 @@ async def incoming_call_webhook(request: Request):
             <Parameter name="call_sid" value="{call_sid}" />
         </Stream>
     </Connect>
-    <Redirect method="POST">{redirect_url}</Redirect>
+    <Hangup />
 </Response>
 """
     return Response(content=texml_response.strip(), media_type="application/xml")
@@ -915,7 +935,9 @@ async def incoming_call_after_stream(request: Request):
         logger.info(f"[MID-CALL TRANSFER EXECUTED] Dialing {target} for SID {call_sid}")
         xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Dial timeout="25">{target}</Dial>
+    <Dial callerId="{TELNYX_PHONE_NUMBER}" timeout="25">
+        <Number>{target}</Number>
+    </Dial>
 </Response>
 """
         return Response(content=xml.strip(), media_type="application/xml")

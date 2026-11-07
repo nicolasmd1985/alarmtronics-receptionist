@@ -14,7 +14,8 @@ from server import (
     load_forwarding_config,
     set_operational_mode,
     build_system_prompt,
-    PENDING_TRANSFERS
+    PENDING_TRANSFERS,
+    TELNYX_PHONE_NUMBER
 )
 
 client = TestClient(app)
@@ -85,23 +86,38 @@ def test_incoming_call_direct_mode():
     )
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("application/xml")
-    assert "<Dial timeout=\"25\">+19043850726</Dial>" in resp.text
+    assert f'callerId="{TELNYX_PHONE_NUMBER}"' in resp.text
+    assert "<Number>+19043850726</Number>" in resp.text
     assert "<Stream" not in resp.text
-    print("✓ Direct mode immediately dials +19043850726 without engaging AI.")
+    print("✓ Direct mode immediately dials +19043850726 with authorized callerId without engaging AI.")
 
 def test_incoming_call_ai_modes():
     print("\n--- Test: Incoming Call in AI Modes ---")
+    # 1. AI Hybrid Mode (with action callback)
     set_operational_mode("ai_hybrid")
-
     resp = client.post(
         "/incoming-call",
-        data={"From": "+14075550199", "CallSid": "TEST_CALL_AI"},
+        data={"From": "+14075550199", "CallSid": "TEST_CALL_AI_HYBRID"},
         headers={"Content-Type": "application/x-www-form-urlencoded"}
     )
     assert resp.status_code == 200
+    assert "<Connect action=" in resp.text
     assert "<Stream" in resp.text
     assert "/incoming-call-after-stream" in resp.text
-    print("✓ AI mode dispatches TeXML stream.")
+    print("✓ AI Hybrid mode dispatches TeXML stream with action callback.")
+
+    # 2. Solo IA Mode (clean stream then hangup, no action callback)
+    set_operational_mode("ai_only")
+    resp = client.post(
+        "/incoming-call",
+        data={"From": "+14075550199", "CallSid": "TEST_CALL_AI_ONLY"},
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    assert resp.status_code == 200
+    assert "<Connect>" in resp.text
+    assert "<Hangup" in resp.text
+    assert "incoming-call-after-stream" not in resp.text
+    print("✓ Solo IA mode dispatches pure TeXML stream with Hangup (100% autonomous).")
 
 def test_mid_call_transfer_permission_enforcement():
     print("\n--- Test: Mid-Call Transfer Permission Enforcement ---")
@@ -116,8 +132,9 @@ def test_mid_call_transfer_permission_enforcement():
     }
     resp = client.post(f"/incoming-call-after-stream?call_sid={call_sid}")
     assert resp.status_code == 200
-    assert "<Dial timeout=\"25\">+19043850726</Dial>" in resp.text
-    print("✓ Transfer allowed -> Bridges call to +19043850726.")
+    assert f'callerId="{TELNYX_PHONE_NUMBER}"' in resp.text
+    assert "<Number>+19043850726</Number>" in resp.text
+    print("✓ Transfer allowed -> Bridges call to +19043850726 with authorized callerId.")
 
     # Case 2: allow_human_transfer == False (Solo IA) -> Hangup cleanly without dialing
     set_operational_mode("ai_only")
