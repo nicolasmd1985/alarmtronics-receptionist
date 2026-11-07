@@ -208,12 +208,15 @@ async def transfer_call_control_v2(call_control_id: str, target_phone: str) -> b
         logger.error(f"[TELNYX CCv2 TRANSFER ERROR] {e}")
     return False
 
-# Initialize GenAI Client
+# Initialize GenAI Client (explicitly using v1beta required by Gemini Live BidiGenerateContent WebSocket API)
 gemini_client = None
 if GEMINI_API_KEY:
     try:
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-        logger.info(f"Google GenAI Client initialized successfully for Live model: {GEMINI_LIVE_MODEL}")
+        gemini_client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options={"api_version": "v1beta"},
+        )
+        logger.info(f"Google GenAI Client (v1beta) initialized successfully for Live model: {GEMINI_LIVE_MODEL}")
     except Exception as e:
         logger.error(f"Failed to initialize Google GenAI Client: {e}")
 else:
@@ -840,6 +843,11 @@ async def incoming_call_webhook(request: Request):
 
     cfg = load_forwarding_config()
     target = cfg.get("forward_to_number", FORWARD_TO_NUMBER)
+    host = PUBLIC_DOMAIN or request.headers.get("host") or "localhost:8000"
+    scheme = "https" if "trycloudflare.com" in host or "voz." in host or request.url.scheme == "https" else request.url.scheme
+    ws_scheme = "wss" if scheme == "https" else "ws"
+    stream_url = f"{ws_scheme}://{host}/media-stream"
+    dial_status_url = f"{scheme}://{host}/dial-status"
 
     # 1. Immediate Call Forwarding if Active
     if cfg.get("call_forwarding_active", False):
@@ -862,7 +870,7 @@ async def incoming_call_webhook(request: Request):
         # TeXML Dial response (with authorized Caller ID and Number encapsulation):
         texml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Dial callerId="{TELNYX_PHONE_NUMBER}" timeout="25">
+    <Dial action="{dial_status_url}" method="POST" callerId="{TELNYX_PHONE_NUMBER}" timeout="25">
         <Number>{target}</Number>
     </Dial>
 </Response>
@@ -870,11 +878,6 @@ async def incoming_call_webhook(request: Request):
         return Response(content=texml_response.strip(), media_type="application/xml")
 
     # 2. Inactive Forwarding: Route to AI Voice Receptionist
-    host = PUBLIC_DOMAIN or request.headers.get("host") or "localhost:8000"
-    scheme = "https" if "trycloudflare.com" in host or "voz." in host or request.url.scheme == "https" else request.url.scheme
-    ws_scheme = "wss" if scheme == "https" else "ws"
-    stream_url = f"{ws_scheme}://{host}/media-stream"
-
     allow_transfer = cfg.get("allow_human_transfer", True)
     logger.info(f"[INCOMING CALL -> AI] SID: {call_sid} | From: {caller_from} | Allow Transfer: {allow_transfer} | Stream: {stream_url}")
 
@@ -905,6 +908,25 @@ async def incoming_call_webhook(request: Request):
 </Response>
 """
     return Response(content=texml_response.strip(), media_type="application/xml")
+
+@app.api_route("/dial-status", methods=["GET", "POST"])
+async def dial_status_webhook(request: Request):
+    """Logs Telnyx <Dial> completion/failure status and SIP response codes."""
+    params = dict(request.query_params)
+    try:
+        form = await request.form()
+        params.update(dict(form))
+    except Exception:
+        pass
+    dial_status = params.get("DialCallStatus", "unknown")
+    sip_code = params.get("DialSipResponseCode", "N/A")
+    logger.info(f"[DIAL STATUS CALLBACK] Status: {dial_status} | SIP Code: {sip_code} | Details: {params}")
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Hangup />
+</Response>
+"""
+    return Response(content=xml.strip(), media_type="application/xml")
 
 @app.api_route("/incoming-call-after-stream", methods=["GET", "POST"])
 async def incoming_call_after_stream(request: Request):
@@ -1088,7 +1110,7 @@ async def handle_media_stream(websocket: WebSocket):
         call_cfg = load_forwarding_config()
         allow_human_transfer = call_cfg.get("allow_human_transfer", True)
         call_prompt = build_system_prompt(allow_human_transfer)
-        call_tools = [TRANSFER_TOOL] if allow_human_transfer else []
+        call_tools = [TRANSFER_TOOL] if allow_human_transfer else None
 
         logger.info(f"[CALL SESSION CONFIG] AI Answering | Allow Human Transfer: {allow_human_transfer}")
 
