@@ -1,8 +1,8 @@
 # RESUMEN DEL PROYECTO Y ESTADO ACTUAL: RECEPCIONISTA VIRTUAL AI (ALARMTRONICS)
 
-**Última Actualización:** 7 de Noviembre, 2026  
+**Última Actualización:** 8 de Noviembre, 2026  
 **Línea Telefónica Activa (Telnyx):** `+1 (407) 305-0475` (Florida Central)  
-**Número Destino de Desvío / Transferencia (Nicolas):** `+1 (904) 385-0726`  
+**Número Destino de Desvío / Transferencia (Nicolas):** `+1 (904) 385-0725`  
 **Dominio Público / Panel Web / Webhook:** `https://voz.nicolasmahecha.com`  
 **WebSocket Media Stream:** `wss://voz.nicolasmahecha.com/media-stream`  
 **Servidor de Producción (GCP):** `35.255.35.187` (usuario: `nicolasmelectronic`)  
@@ -59,11 +59,22 @@ El sistema opera con **Google Gemini Live API (`gemini-3.1-flash-live-preview` s
 - **Modo IA Híbrida (`ai_hybrid`):** Utiliza el atributo nativo `<Connect action=".../incoming-call-after-stream" method="POST">` en lugar de un `<Redirect>` posterior a `<Connect>` (ya que en TeXML `<Stream>` es asíncrono y un `<Redirect>` hermano se ejecutaba prematuramente).
 - **Modo Desvío (`direct`):** Incluye explícitamente `callerId="+14073050475"` y `<Number>+19043850725</Number>` dentro de `<Dial>`.
 
+### D. Diagnóstico del Error SIP 604 en Desvío y Corrección de Número Destino (8 de Noviembre, 2026)
+- **Configuración de Carrier Confirmada:** Se verificó y confirmó en el Telnyx Mission Control Portal que la aplicación TeXML `Nicolas Receptionist Agent` tiene asignado el perfil saliente `Default` activo con permisos para llamadas PSTN a EE.UU. (+1).
+- **Diagnóstico en Vivo vía Webhook `/dial-status`:**
+  - Al activar el modo desvío y recibir llamada entrante de prueba (`+14077444685`), Telnyx originó correctamente la llamada saliente (`FlowDestination: non_telnyx_pstn_number`, `TelnyxError: ''`), pero la red telefónica destino cortó inmediatamente (`HangupSource: callee`, `DialCallStatus: busy`, `SipHangupCause: 604`).
+  - En señalización SIP, un código `604 ("Does Not Exist Anywhere")` generado por el extremo receptor indica de forma inequívoca que el número telefónico marcado no existe o tiene dígitos erróneos en la red del operador.
+- **Causa Raíz:** El número configurado originalmente tenía un dígito incorrecto (`+19043850726` en lugar de `+19043850725`).
+- **Solución y Despliegue en Caliente:**
+  - Se corrigió el número a `+19043850725` en `server.py`, `.env`, `.env.example`, `data/config.json`, flujos de GitHub Actions y suite de tests.
+  - Se inyectó la corrección en vivo al contenedor `alarmtronics-receptionist` en el servidor de producción GCP (`35.255.35.187`) y se recreó el contenedor sin pérdidas de servicio.
+  - Se ejecutaron los tests automatizados locales con 100% de éxito.
+
 ---
 
 ## 3. Verificación de Llamadas Reales en Producción
 
-### Prueba en Vivo — 7 de Noviembre, 2026 (18:03 UTC)
+### Prueba en Vivo 1 — 7 de Noviembre, 2026 (18:03 UTC)
 - **Origen:** `+1 (689) 249-0957` (Nicolas) $\rightarrow$ `+1 (407) 305-0475`
 - **Modo Activo:** `Solo IA` (`ai_only`)
 - **Desarrollo de la Llamada:**
@@ -71,6 +82,13 @@ El sistema opera con **Google Gemini Live API (`gemini-3.1-flash-live-preview` s
   2. Captura de nombre (`Nicolas`), problema (`alarm is dead`), dirección (`223 Orlando Avenue`) y teléfono de retorno.
   3. Despedida automática de la IA y desconexión limpia tras 61.0 segundos y 9 turnos (`[AUTO HANGUP]`).
   4. Extracción estructurada con `gemini-flash-lite-latest` (`HTTP 200 OK`) y almacenamiento en `/app/data/leads.db` y `/app/data/leads.json`.
+
+### Prueba en Vivo 2 — 8 de Noviembre, 2026 (17:45 UTC)
+- **Origen:** `+1 (407) 744-4685` (Nicolas) $\rightarrow$ `+1 (407) 305-0475`
+- **Modos Probados:**
+  1. **Modo Desvío Directo:** Validó la emisión del `<Dial>` saliente en Telnyx y la captura de telemetría completa por el webhook `/dial-status`.
+  2. **Modo IA Híbrida (`ai_hybrid`):** Verificó la conexión WebSocket en tiempo real (`wss://voz.nicolasmahecha.com/media-stream`), saludo del agente virtual y detección de corte sin excepciones.
+  3. **Corrección de destino:** Actualizado a `+19043850725`.
 
 ---
 
