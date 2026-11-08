@@ -52,7 +52,7 @@ jobs:
           OWNER_NAME=${{ secrets.OWNER_NAME || 'Alarmtronics' }}
           DEFAULT_LANGUAGE=en
           TELNYX_PHONE_NUMBER=${{ secrets.TELNYX_PHONE_NUMBER || '+14073050475' }}
-          FORWARD_TO_NUMBER=${{ secrets.FORWARD_TO_NUMBER || '+19043850726' }}
+          FORWARD_TO_NUMBER=${{ secrets.FORWARD_TO_NUMBER || '+19043850725' }}
           CALL_FORWARDING_ACTIVE=${{ secrets.CALL_FORWARDING_ACTIVE || 'false' }}
           ALLOW_HUMAN_TRANSFER=${{ secrets.ALLOW_HUMAN_TRANSFER || 'true' }}
           TELNYX_API_KEY=${{ secrets.TELNYX_API_KEY || '' }}

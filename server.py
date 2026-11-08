@@ -66,7 +66,7 @@ GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-previe
 GEMINI_VOICE = os.getenv("GEMINI_VOICE", "Aoede")
 PUBLIC_DOMAIN = os.getenv("PUBLIC_DOMAIN", "").strip()
 TELNYX_PHONE_NUMBER = os.getenv("TELNYX_PHONE_NUMBER", "+14073050475")
-FORWARD_TO_NUMBER = os.getenv("FORWARD_TO_NUMBER", "+19043850726").strip()
+FORWARD_TO_NUMBER = os.getenv("FORWARD_TO_NUMBER", "+19043850725").strip()
 TELNYX_API_KEY = os.getenv("TELNYX_API_KEY", "").strip()
 
 # ==============================================================================
@@ -80,7 +80,7 @@ def load_forwarding_config() -> Dict[str, Any]:
     default_config = {
         "call_forwarding_active": default_active,
         "allow_human_transfer": default_allow_transfer,
-        "forward_to_number": FORWARD_TO_NUMBER or "+19043850726",
+        "forward_to_number": FORWARD_TO_NUMBER or "+19043850725",
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     if not CONFIG_PATH.exists():
@@ -98,8 +98,8 @@ def load_forwarding_config() -> Dict[str, Any]:
                 cfg["call_forwarding_active"] = default_active
             if "allow_human_transfer" not in cfg:
                 cfg["allow_human_transfer"] = default_allow_transfer
-            if "forward_to_number" not in cfg or not cfg["forward_to_number"]:
-                cfg["forward_to_number"] = FORWARD_TO_NUMBER or "+19043850726"
+            if "forward_to_number" not in cfg or not cfg["forward_to_number"] or cfg["forward_to_number"] == "+19043850726":
+                cfg["forward_to_number"] = FORWARD_TO_NUMBER or "+19043850725"
             return cfg
     except Exception as e:
         logger.error(f"Error reading config.json: {e}")

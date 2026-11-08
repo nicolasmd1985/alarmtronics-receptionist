@@ -178,16 +178,16 @@ Keep Namecheap BasicDNS as authoritative nameservers without changing them:
 
 ---
 
-## Call Forwarding & Operational Presets (+19043850726)
+## Call Forwarding & Operational Presets (+19043850725)
 
 The system supports hot-swapping between 3 operational modes in real time:
 
 1. **Modo 1: Desvío Directo Manual (`mode: direct`):**
-   - Incoming calls to `+1 (407) 305-0475` ring directly on Nicolas's phone (`+19043850726`).
+   - Incoming calls to `+1 (407) 305-0475` ring directly on Nicolas's phone (`+19043850725`).
    - You answer manually. AI is completely bypassed and WebSockets are not connected.
 2. **Modo 2: IA Híbrida con Transferencia (`mode: ai_hybrid`):**
    - The AI virtual receptionist answers automatically.
-   - **Solo si el cliente pide hablar con un humano o con Nicolas**, la IA anuncia una frase de cortesía y transfiere la llamada activa en vivo al `+19043850726`.
+   - **Solo si el cliente pide hablar con un humano o con Nicolas**, la IA anuncia una frase de cortesía y transfiere la llamada activa en vivo al `+19043850725`.
    - Si no pide transferencia, la IA recopila los datos del cliente, guarda el ticket y concluye la llamada normalmente.
 3. **Modo 3: Solo IA Autónoma 100% (`mode: ai_only`):**
    - La IA atiende el 100% de la llamada y registra toda la información en SQLite y JSON.

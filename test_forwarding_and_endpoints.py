@@ -87,9 +87,9 @@ def test_incoming_call_direct_mode():
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("application/xml")
     assert f'callerId="{TELNYX_PHONE_NUMBER}"' in resp.text
-    assert "<Number>+19043850726</Number>" in resp.text
+    assert "<Number>+19043850725</Number>" in resp.text
     assert "<Stream" not in resp.text
-    print("✓ Direct mode immediately dials +19043850726 with authorized callerId without engaging AI.")
+    print("✓ Direct mode immediately dials +19043850725 with authorized callerId without engaging AI.")
 
 def test_incoming_call_ai_modes():
     print("\n--- Test: Incoming Call in AI Modes ---")
@@ -121,27 +121,27 @@ def test_incoming_call_ai_modes():
 
 def test_mid_call_transfer_permission_enforcement():
     print("\n--- Test: Mid-Call Transfer Permission Enforcement ---")
-    # Case 1: allow_human_transfer == True -> Dial +19043850726
+    # Case 1: allow_human_transfer == True -> Dial +19043850725
     set_operational_mode("ai_hybrid")
     call_sid = "TEST_TRANSFER_ALLOWED"
     PENDING_TRANSFERS[call_sid] = {
         "transfer": True,
-        "target": "+19043850726",
+        "target": "+19043850725",
         "reason": "Caller asked for Nicolas",
         "timestamp": 1234567890
     }
     resp = client.post(f"/incoming-call-after-stream?call_sid={call_sid}")
     assert resp.status_code == 200
     assert f'callerId="{TELNYX_PHONE_NUMBER}"' in resp.text
-    assert "<Number>+19043850726</Number>" in resp.text
-    print("✓ Transfer allowed -> Bridges call to +19043850726 with authorized callerId.")
+    assert "<Number>+19043850725</Number>" in resp.text
+    print("✓ Transfer allowed -> Bridges call to +19043850725 with authorized callerId.")
 
     # Case 2: allow_human_transfer == False (Solo IA) -> Hangup cleanly without dialing
     set_operational_mode("ai_only")
     call_sid = "TEST_TRANSFER_BLOCKED"
     PENDING_TRANSFERS[call_sid] = {
         "transfer": True,
-        "target": "+19043850726",
+        "target": "+19043850725",
         "reason": "Caller asked for human in Solo IA mode",
         "timestamp": 1234567890
     }
