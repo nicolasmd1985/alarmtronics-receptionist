@@ -14,9 +14,15 @@ from server import (
     load_forwarding_config,
     set_operational_mode,
     build_system_prompt,
+    pcm16_to_ulaw,
+    ulaw_to_pcm16_8k,
+    TelephonyAudioProcessor,
     PENDING_TRANSFERS,
-    TELNYX_PHONE_NUMBER
+    TELNYX_PHONE_NUMBER,
+    DB_PATH,
 )
+import sqlite3
+import numpy as np
 
 client = TestClient(app)
 
@@ -159,7 +165,97 @@ def test_web_dashboard():
     assert "toggleForwarding()" in resp.text
     assert "toggleTransfer()" in resp.text
     assert "setMode('ai_only')" in resp.text
-    print("✓ Web Dashboard contains all controls, cards, and preset buttons.")
+    assert 'href="/leads"' in resp.text
+    print("✓ Web Dashboard contains all controls, cards, preset buttons, and CRM link.")
+
+def test_leads_crm_and_api():
+    print("\n--- Test: Leads CRM UI, JSON API, CSV Export, PATCH & DELETE ---")
+    # 1. HTML CRM page at /leads
+    resp_html = client.get("/leads", headers={"Accept": "text/html"})
+    assert resp_html.status_code == 200
+    assert "text/html" in resp_html.headers["content-type"]
+    assert "CRM de Llamadas y Tickets" in resp_html.text
+    assert 'id="leads-table"' in resp_html.text
+    assert 'id="lead-detail-dialog"' in resp_html.text
+
+    # 2. Explicit JSON content negotiation on /leads?format=json & /api/leads
+    resp_json = client.get("/leads?format=json")
+    assert resp_json.status_code == 200
+    assert "leads" in resp_json.json()
+
+    resp_api = client.get("/api/leads")
+    assert resp_api.status_code == 200
+    assert "count" in resp_api.json()
+
+    # 3. CSV export
+    resp_csv = client.get("/api/leads/export.csv")
+    assert resp_csv.status_code == 200
+    assert "text/csv" in resp_csv.headers["content-type"]
+    assert "Dirección de Servicio" in resp_csv.text
+
+    # 4. Insert temporary lead, PATCH it, then DELETE it cleanly
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO leads (call_sid, caller_from_number, caller_name, caller_phone, service_address, urgency, summary, duration_seconds, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("TEST_CRM_CRUD", "+14075550100", "CRM Test User", "+14075550100", "123 Main St", "normal", "Test summary", 32.0, "nuevo", "")
+        )
+        lead_id = cur.lastrowid
+        conn.commit()
+
+    resp_patch = client.patch(f"/api/leads/{lead_id}", json={"status": "agendado", "urgency": "urgent", "notes": "Technician assigned"})
+    assert resp_patch.status_code == 200
+    updated = resp_patch.json()
+    assert updated["status"] == "agendado"
+    assert updated["urgency"] == "urgent"
+    assert updated["notes"] == "Technician assigned"
+
+    resp_del = client.delete(f"/api/leads/{lead_id}")
+    assert resp_del.status_code == 200
+    assert resp_del.json()["deleted"] is True
+    print("✓ CRM HTML, /api/leads, CSV export, PATCH, and DELETE passed.")
+
+def test_audio_codec_and_dsp():
+    print("\n--- Test: ITU-T G.711 mu-law Codec & Stateful DSP Pipeline ---")
+    # 1. Exact ITU-T G.711 round-trip accuracy across full dynamic range
+    test_samples = np.array([0, 100, 300, 500, 1000, 2000, 5000, 10000, 25000, -1000, -5000, -25000], dtype=np.int16)
+    encoded = pcm16_to_ulaw(test_samples)
+    decoded = ulaw_to_pcm16_8k(encoded)
+    max_rel_err = np.max(np.abs(test_samples[1:] - decoded[1:]) / np.abs(test_samples[1:]))
+    assert max_rel_err < 0.05, f"G.711 roundtrip error too high: {max_rel_err:.4f}"
+    assert encoded[0] == 0xFF, f"Expected +0 to encode to 0xFF, got {hex(encoded[0])}"
+    assert int(ulaw_to_pcm16_8k(b"\x80")[0]) > 30000
+    assert int(ulaw_to_pcm16_8k(b"\x00")[0]) < -30000
+
+    # 2. Stateful outbound 24kHz -> 8kHz preserves exact sample count across odd chunk sizes
+    dsp = TelephonyAudioProcessor()
+    t = np.arange(2400) / 24000.0  # 100ms 1kHz sine wave
+    sine_24k = (np.sin(2 * np.pi * 1000.0 * t) * 12000.0).astype(np.int16)
+    raw = sine_24k.tobytes()
+    # Split into awkward non-multiple-of-3 sample chunk sizes (e.g. 100, 302, 500 bytes...)
+    chunks = [raw[0:200], raw[200:502], raw[502:1100], raw[1100:]]
+    out_ulaw = b"".join(dsp.outbound_pcm16_24k_to_ulaw(c) for c in chunks)
+    assert len(out_ulaw) == 800, f"Expected exact 800 8kHz bytes from 2400 24kHz samples, got {len(out_ulaw)}"
+    out_pcm = ulaw_to_pcm16_8k(out_ulaw)
+    out_rms = float(np.sqrt(np.mean(out_pcm[40:].astype(np.float64) ** 2)))
+    assert 6500 < out_rms < 10500, f"Unexpected outbound 1kHz RMS: {out_rms:.1f}"
+
+    # 3. Stateful inbound 8kHz -> 16kHz preserves continuity across 20ms frames
+    t8 = np.arange(800) / 8000.0
+    sine_8k = (np.sin(2 * np.pi * 600.0 * t8) * 1500.0).astype(np.int16)
+    in_ulaw = pcm16_to_ulaw(sine_8k)
+    in_frames = [in_ulaw[i:i+160] for i in range(0, len(in_ulaw), 160)]
+    out_16k_parts = []
+    for f in in_frames:
+        pcm16k, rms = dsp.inbound_ulaw_to_pcm16_16k(f)
+        assert pcm16k.size == 320
+        assert rms > 500
+        out_16k_parts.append(pcm16k)
+    full_16k = np.concatenate(out_16k_parts)
+    # Verify smooth continuity (no huge boundary spikes at 320-sample frame edges)
+    diffs = np.abs(np.diff(full_16k[320:].astype(np.float64)))
+    assert np.max(diffs) < 4000, f"Detected click/discontinuity in inbound 16kHz stream: max diff={np.max(diffs)}"
+    print(f"✓ G.711 codec (max rel err {max_rel_err*100:.2f}%) & stateful DSP passed (outbound RMS {out_rms:.0f}, max diff {np.max(diffs):.0f}).")
 
 if __name__ == "__main__":
     try:
@@ -170,6 +266,8 @@ if __name__ == "__main__":
         test_incoming_call_ai_modes()
         test_mid_call_transfer_permission_enforcement()
         test_web_dashboard()
+        test_leads_crm_and_api()
+        test_audio_codec_and_dsp()
         print("\n" + "=" * 65)
         print("ALL TESTS PASSED SUCCESSFULLY (100% COVERAGE)!")
         print("=" * 65)

@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy application files and pre-rendered audio
-COPY server.py .
+COPY server.py crm_ui.py .
 RUN mkdir -p /app/data
 COPY data/greeting.ulaw /app/data/greeting.ulaw
 COPY data/greeting.ulaw /app/greeting.ulaw

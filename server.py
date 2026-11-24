@@ -14,6 +14,8 @@ Stack:
 
 import os
 import sys
+import csv
+import io
 import json
 import time
 import base64
@@ -22,6 +24,7 @@ import sqlite3
 import logging
 import threading
 import argparse
+from collections import deque
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -36,6 +39,8 @@ from fastapi.responses import Response, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
+
+from crm_ui import render_leads_crm_html
 
 # Load environment variables
 load_dotenv()
@@ -223,43 +228,42 @@ else:
     logger.warning("GEMINI_API_KEY not configured. Calls will not be able to connect to Live API.")
 
 # ==============================================================================
-# 1. High-Performance ITU-T G.711 u-law Codec & Resampling Engine
+# 1. High-Performance ITU-T G.711 u-law Codec & Stateful Streaming DSP Engine
 # ==============================================================================
 
 def _generate_ulaw_tables():
-    """Generates O(1) lookup tables for G.711 mu-law decoding and encoding."""
+    """Generates exact ITU-T G.711 mu-law O(1) lookup tables (verified 0xFF=+0, 0x80=+32124, 0x00=-32124)."""
     decode_table = np.zeros(256, dtype=np.int16)
     for i in range(256):
-        u = ~i & 0xFF
+        u = (~i) & 0xFF
         sign = u & 0x80
         exponent = (u >> 4) & 0x07
         mantissa = u & 0x0F
-        sample = ((mantissa << 3) + 0x84) << exponent
-        sample -= 0x84
-        decode_table[i] = -sample if not sign else sample
+        sample = (((mantissa << 3) + 0x84) << exponent) - 0x84
+        decode_table[i] = -sample if sign else sample
 
     encode_table = np.zeros(65536, dtype=np.uint8)
     BIAS = 0x84
     CLIP = 32635
     for s in range(-32768, 32768):
-        sample = s
-        sign = 0x80 if sample < 0 else 0
-        if sample < 0:
-            sample = -sample
-        if sample > CLIP:
-            sample = CLIP
-        sample += BIAS
-        exponent = 7
-        for exp in range(7):
-            if sample <= (0xFF << (exp + 3)):
-                exponent = exp
-                break
-        mantissa = (sample >> (exponent + 3)) & 0x0F
+        sign = 0x80 if s < 0 else 0
+        mag = -s if s < 0 else s
+        if mag > CLIP:
+            mag = CLIP
+        mag += BIAS
+        # Segment exponent: biased mag in [0x84..0x7FFF] has bit_length in [8..15] -> exponent [0..7]
+        exponent = max(0, min(7, mag.bit_length() - 8))
+        mantissa = (mag >> (exponent + 3)) & 0x0F
         encode_table[s + 32768] = (~(sign | (exponent << 4) | mantissa)) & 0xFF
 
     return decode_table, encode_table
 
 ULAW_DECODE_LUT, ULAW_ENCODE_LUT = _generate_ulaw_tables()
+
+# Pre-computed zero-overhead Butterworth SOS filters for stateful telephony streaming
+HPF_8K_SOS = scipy.signal.butter(2, 85.0, btype="high", fs=8000, output="sos")
+UP_LPF_16K_SOS = scipy.signal.butter(4, 3650.0, btype="low", fs=16000, output="sos")
+DOWN_LPF_24K_SOS = scipy.signal.butter(4, 3550.0, btype="low", fs=24000, output="sos")
 
 def ulaw_to_pcm16_8k(ulaw_bytes: bytes) -> np.ndarray:
     """Decode raw G.711 mu-law 8kHz bytes into signed 16-bit PCM numpy array."""
@@ -267,19 +271,103 @@ def ulaw_to_pcm16_8k(ulaw_bytes: bytes) -> np.ndarray:
     return ULAW_DECODE_LUT[indices]
 
 def pcm16_to_ulaw(pcm16_samples: np.ndarray) -> bytes:
-    """Encode signed 16-bit PCM numpy array into G.711 mu-law bytes."""
-    indices = (pcm16_samples.astype(np.int32) + 32768).astype(np.uint16)
+    """Encode signed 16-bit PCM numpy array into exact ITU-T G.711 mu-law bytes."""
+    clipped = np.clip(pcm16_samples, -32768, 32767)
+    indices = (clipped.astype(np.int32) + 32768).astype(np.uint16)
     return ULAW_ENCODE_LUT[indices].tobytes()
 
+def _soft_limit_pcm16(samples: np.ndarray, threshold: float = 28000.0) -> np.ndarray:
+    """Smoothly soft-limits peaks above threshold to avoid harsh digital clipping."""
+    out = samples.astype(np.float64, copy=False)
+    headroom = 32767.0 - threshold
+    pos_mask = out > threshold
+    neg_mask = out < -threshold
+    if np.any(pos_mask):
+        out = out.copy()
+        out[pos_mask] = threshold + headroom * np.tanh((out[pos_mask] - threshold) / headroom)
+    if np.any(neg_mask):
+        if not np.any(pos_mask):
+            out = out.copy()
+        out[neg_mask] = -threshold - headroom * np.tanh((-out[neg_mask] - threshold) / headroom)
+    return np.clip(np.rint(out), -32768, 32767).astype(np.int16)
+
+class TelephonyAudioProcessor:
+    """Per-call stateful streaming DSP processor.
+    Eliminates chunk-boundary clicks/50Hz modulation, strips PSTN hum/DC offset,
+    normalizes quiet cell-phone speech gently for ASR, and prevents aliasing on 24kHz->8kHz.
+    """
+
+    def __init__(self):
+        self.hpf_8k_zi = np.zeros((HPF_8K_SOS.shape[0], 2), dtype=np.float64)
+        self.up_16k_zi = np.zeros((UP_LPF_16K_SOS.shape[0], 2), dtype=np.float64)
+        self.down_24k_zi = np.zeros((DOWN_LPF_24K_SOS.shape[0], 2), dtype=np.float64)
+        self.down_24k_remainder = np.empty(0, dtype=np.int16)
+        self.agc_gain = 1.0
+
+    def inbound_ulaw_to_pcm16_16k(self, ulaw_bytes: bytes) -> tuple[np.ndarray, float]:
+        """Stateful 8kHz G.711 mu-law -> conditioned 16kHz PCM16 for Gemini Live ASR."""
+        if not ulaw_bytes:
+            return np.empty(0, dtype=np.int16), 0.0
+
+        pcm_8k = ulaw_to_pcm16_8k(ulaw_bytes).astype(np.float64)
+        # 1. Strip DC offset, 60Hz hum, and cellular low-end rumble
+        hp_8k, self.hpf_8k_zi = scipy.signal.sosfilt(HPF_8K_SOS, pcm_8k, zi=self.hpf_8k_zi)
+        rms = float(np.sqrt(np.mean(hp_8k * hp_8k))) if hp_8k.size else 0.0
+
+        # 2. Smooth speech AGC: gently lift quiet callers without amplifying line hiss
+        if rms > 180.0:
+            desired_gain = min(2.4, max(0.8, 2200.0 / rms))
+            alpha = 0.25 if desired_gain < self.agc_gain else 0.08
+            self.agc_gain += alpha * (desired_gain - self.agc_gain)
+        else:
+            # Relax gradually toward unity during silence
+            self.agc_gain += 0.03 * (1.0 - self.agc_gain)
+
+        conditioned_8k = hp_8k * self.agc_gain
+
+        # 3. Stateful 2x upsampling: zero-stuff + low-pass reconstruction filter (gain=2.0)
+        upsampled = np.zeros(conditioned_8k.size * 2, dtype=np.float64)
+        upsampled[0::2] = conditioned_8k * 2.0
+        filtered_16k, self.up_16k_zi = scipy.signal.sosfilt(UP_LPF_16K_SOS, upsampled, zi=self.up_16k_zi)
+        return _soft_limit_pcm16(filtered_16k), rms
+
+    def outbound_pcm16_24k_to_ulaw(self, raw_24k: bytes) -> bytes:
+        """Stateful 24kHz PCM16 -> anti-aliased 8kHz G.711 mu-law (zero boundary clicks)."""
+        if not raw_24k:
+            return b""
+        # Guarantee even byte length for int16 view
+        usable_len = len(raw_24k) - (len(raw_24k) % 2)
+        if usable_len <= 0:
+            return b""
+        samples = np.frombuffer(raw_24k[:usable_len], dtype=np.int16)
+        if self.down_24k_remainder.size > 0:
+            samples = np.concatenate((self.down_24k_remainder, samples))
+
+        rem = samples.size % 3
+        if rem:
+            self.down_24k_remainder = samples[-rem:].copy()
+            samples = samples[:-rem]
+        else:
+            self.down_24k_remainder = np.empty(0, dtype=np.int16)
+
+        if samples.size == 0:
+            return b""
+
+        filtered_24k, self.down_24k_zi = scipy.signal.sosfilt(
+            DOWN_LPF_24K_SOS, samples.astype(np.float64), zi=self.down_24k_zi
+        )
+        decimated_8k = _soft_limit_pcm16(filtered_24k[::3])
+        return pcm16_to_ulaw(decimated_8k)
+
 def resample_8k_to_16k(pcm16_8k: np.ndarray) -> np.ndarray:
-    """Upsample 8kHz PCM16 to 16kHz PCM16 for Gemini Live input."""
+    """Stateless 8kHz -> 16kHz helper (for one-shot scripts/tests)."""
     resampled = scipy.signal.resample_poly(pcm16_8k.astype(np.float32), 2, 1)
     return np.clip(resampled, -32768, 32767).astype(np.int16)
 
 def resample_24k_to_8k(pcm16_24k: np.ndarray) -> np.ndarray:
-    """Downsample Gemini 24kHz PCM16 to 8000Hz PCM16 (exact 3:1 decimation)."""
-    resampled = scipy.signal.resample_poly(pcm16_24k.astype(np.float32), 1, 3)
-    return np.clip(resampled, -32768, 32767).astype(np.int16)
+    """Stateless 24kHz -> 8kHz helper with clean anti-aliasing (for one-shot scripts/tests)."""
+    filtered = scipy.signal.sosfiltfilt(DOWN_LPF_24K_SOS, pcm16_24k.astype(np.float64)) if pcm16_24k.size > 24 else pcm16_24k.astype(np.float64)
+    return _soft_limit_pcm16(filtered[::3])
 
 # ==============================================================================
 # 2. Conversational Persona & System Instructions
@@ -424,15 +512,23 @@ def init_database():
                 language TEXT,
                 summary TEXT,
                 transcript_json TEXT,
-                duration_seconds REAL
+                duration_seconds REAL,
+                status TEXT DEFAULT 'nuevo',
+                notes TEXT DEFAULT ''
             )
         """)
         conn.commit()
         cursor.execute("PRAGMA table_info(leads)")
         existing_cols = [r[1] for r in cursor.fetchall()]
-        for col in ["service_address", "system_type", "issue_description"]:
+        for col, col_def in [
+            ("service_address", "TEXT"),
+            ("system_type", "TEXT"),
+            ("issue_description", "TEXT"),
+            ("status", "TEXT DEFAULT 'nuevo'"),
+            ("notes", "TEXT DEFAULT ''"),
+        ]:
             if col not in existing_cols:
-                cursor.execute(f"ALTER TABLE leads ADD COLUMN {col} TEXT")
+                cursor.execute(f"ALTER TABLE leads ADD COLUMN {col} {col_def}")
         conn.commit()
     logger.info(f"Database initialized at {DB_PATH}")
 
@@ -447,8 +543,9 @@ def save_lead_record(call_sid: str, caller_from: str, lead: LeadExtractionSchema
                 INSERT INTO leads (
                     call_sid, caller_from_number, caller_name, caller_phone,
                     service_address, system_type, issue_description, reason_for_call,
-                    urgency, language, summary, transcript_json, duration_seconds
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    urgency, language, summary, transcript_json, duration_seconds,
+                    status, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'nuevo', '')
             """, (
                 call_sid, caller_from, lead.caller_name, lead.caller_phone,
                 lead.service_address, lead.system_type, lead.issue_description, lead.issue_description,
@@ -693,7 +790,10 @@ async def root_dashboard(request: Request):
                 <tr><td>Base de Datos</td><td>SQLite ({DB_PATH.name}) + JSON Audit</td><td>SINCRONIZADO</td></tr>
             </table>
 
-            <p style="margin-top: 1.5rem;"><a href="/leads" target="_blank">&rarr; Ver Tickets de Servicio Capturados (API JSON)</a></p>
+            <div style="margin-top: 1.5rem; display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center;">
+                <a href="/leads" style="display:inline-flex;align-items:center;gap:0.5rem;background:#38bdf8;color:#0b1120;padding:0.65rem 1.25rem;border-radius:8px;font-weight:800;text-decoration:none;">📋 Abrir CRM de Llamadas y Tickets (/leads)</a>
+                <a href="/api/leads" target="_blank" style="font-size:0.85rem;color:#94a3b8;">API JSON (/api/leads)</a>
+            </div>
         </div>
 
         <script>
@@ -802,21 +902,160 @@ async def health_check():
         },
     }
 
-@app.get("/leads")
-async def list_leads():
-    """Returns captured leads from SQLite."""
+VALID_LEAD_STATUSES = {"nuevo", "en_progreso", "agendado", "resuelto", "descartado"}
+VALID_LEAD_URGENCIES = {"emergency", "urgent", "normal"}
+
+class LeadUpdateRequest(BaseModel):
+    status: Optional[str] = None
+    urgency: Optional[str] = None
+    notes: Optional[str] = None
+
+def _hydrate_lead_row(row: sqlite3.Row) -> Dict[str, Any]:
+    r = dict(row)
+    r["status"] = (r.get("status") or "nuevo").lower()
+    r["notes"] = r.get("notes") or ""
+    if r.get("transcript_json"):
+        try:
+            r["transcript"] = json.loads(r["transcript_json"])
+        except Exception:
+            r["transcript"] = []
+    else:
+        r["transcript"] = []
+    return r
+
+def _query_leads(limit: int = 500) -> List[Dict[str, Any]]:
+    init_database()
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM leads ORDER BY timestamp DESC LIMIT 50")
-        rows = [dict(row) for row in cursor.fetchall()]
-        for r in rows:
-            if r.get("transcript_json"):
-                try:
-                    r["transcript"] = json.loads(r["transcript_json"])
-                except Exception:
-                    pass
-        return {"count": len(rows), "leads": rows}
+        cursor.execute("SELECT * FROM leads ORDER BY timestamp DESC, id DESC LIMIT ?", (max(1, min(limit, 2000)),))
+        return [_hydrate_lead_row(row) for row in cursor.fetchall()]
+
+@app.get("/leads")
+async def leads_crm_page(request: Request):
+    """Serves the Alarmtronics Leads CRM UI (or JSON if explicitly requested via ?format=json or Accept: application/json)."""
+    fmt = (request.query_params.get("format") or "").lower()
+    accept = (request.headers.get("accept") or "").lower()
+    if fmt == "json" or ("application/json" in accept and "text/html" not in accept):
+        rows = _query_leads(limit=500)
+        return JSONResponse({"count": len(rows), "leads": rows})
+
+    cfg = load_forwarding_config()
+    target_num = cfg.get("forward_to_number", FORWARD_TO_NUMBER)
+    html = render_leads_crm_html(
+        company_name=COMPANY_NAME,
+        telnyx_number=TELNYX_PHONE_NUMBER,
+        forward_number=target_num,
+    )
+    return HTMLResponse(content=html)
+
+@app.get("/api/leads")
+async def api_list_leads(
+    limit: int = 500,
+    status: Optional[str] = None,
+    urgency: Optional[str] = None,
+    q: Optional[str] = None,
+):
+    """Returns captured leads from SQLite as JSON for the CRM and integrations."""
+    rows = _query_leads(limit=limit)
+    if status and status != "all":
+        st = status.lower()
+        rows = [r for r in rows if (r.get("status") or "nuevo").lower() == st]
+    if urgency and urgency != "all":
+        urg = urgency.lower()
+        rows = [r for r in rows if (r.get("urgency") or "normal").lower() == urg]
+    if q and q.strip():
+        needle = q.strip().lower()
+        rows = [
+            r for r in rows
+            if needle in " ".join(
+                str(r.get(k) or "") for k in ("caller_name", "caller_phone", "caller_from_number", "service_address", "issue_description", "summary", "notes", "call_sid")
+            ).lower()
+        ]
+    return {"count": len(rows), "leads": rows}
+
+@app.get("/api/leads/export.csv")
+async def api_export_leads_csv():
+    """Exports all captured CRM leads as an Excel-compatible UTF-8 CSV."""
+    rows = _query_leads(limit=2000)
+    buf = io.StringIO()
+    buf.write("\ufeff")  # UTF-8 BOM for Microsoft Excel
+    writer = csv.writer(buf)
+    writer.writerow([
+        "ID", "Fecha (UTC)", "Cliente", "Teléfono", "Caller ID",
+        "Dirección de Servicio", "Tipo de Sistema", "Problema",
+        "Urgencia", "Estado CRM", "Duración (s)", "Resumen IA", "Notas", "Call SID"
+    ])
+    for r in rows:
+        writer.writerow([
+            r.get("id"),
+            r.get("timestamp") or "",
+            r.get("caller_name") or "",
+            r.get("caller_phone") or "",
+            r.get("caller_from_number") or "",
+            r.get("service_address") or "",
+            r.get("system_type") or "",
+            r.get("issue_description") or r.get("reason_for_call") or "",
+            r.get("urgency") or "normal",
+            r.get("status") or "nuevo",
+            round(float(r.get("duration_seconds") or 0), 1),
+            r.get("summary") or "",
+            r.get("notes") or "",
+            r.get("call_sid") or "",
+        ])
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="alarmtronics_leads.csv"'},
+    )
+
+@app.patch("/api/leads/{lead_id}")
+async def api_update_lead(lead_id: int, body: LeadUpdateRequest):
+    """Updates CRM workflow status, urgency, or internal supervisor notes for a lead."""
+    init_database()
+    updates = []
+    params: List[Any] = []
+    if body.status is not None:
+        st = body.status.strip().lower()
+        if st not in VALID_LEAD_STATUSES:
+            raise HTTPException(status_code=400, detail=f"Invalid status: {st}")
+        updates.append("status = ?")
+        params.append(st)
+    if body.urgency is not None:
+        urg = body.urgency.strip().lower()
+        if urg not in VALID_LEAD_URGENCIES:
+            raise HTTPException(status_code=400, detail=f"Invalid urgency: {urg}")
+        updates.append("urgency = ?")
+        params.append(urg)
+    if body.notes is not None:
+        updates.append("notes = ?")
+        params.append(body.notes)
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields provided to update")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        params.append(lead_id)
+        cursor.execute(f"UPDATE leads SET {', '.join(updates)} WHERE id = ?", params)
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Lead not found")
+        conn.commit()
+        row = cursor.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
+        return _hydrate_lead_row(row)
+
+@app.delete("/api/leads/{lead_id}")
+async def api_delete_lead(lead_id: int):
+    """Deletes a call record (e.g. test call or spam) from the SQLite CRM."""
+    init_database()
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM leads WHERE id = ?", (lead_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Lead not found")
+        conn.commit()
+    return {"deleted": True, "id": lead_id}
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def incoming_call_webhook(request: Request):
@@ -1001,11 +1240,25 @@ class CallSession:
         self.hangup_scheduled = False
         self.transfer_requested = False
         self.transfer_reason = ""
+        self.clear_requested = False
+        self.speech_frames_streak = 0
+        self.bargein_frames_streak = 0
+        self.greeting_preroll: deque[bytes] = deque(maxlen=6)
+        self.dsp = TelephonyAudioProcessor()
         self.audio_out_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self.inbound_audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
         self.dialogue_history: List[Dict[str, str]] = []
         self.current_user_text: List[str] = []
         self.current_model_text: List[str] = []
+
+    def clear_audio_output(self):
+        """Immediately drains queued outbound audio and signals the continuous pacer to flush."""
+        self.clear_requested = True
+        while not self.audio_out_queue.empty():
+            try:
+                self.audio_out_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
@@ -1018,21 +1271,82 @@ async def handle_media_stream(websocket: WebSocket):
         await websocket.close()
         return
 
-    # Task A: Dedicated sender loop that paces 20ms frames to Telnyx
+    # Task A: Continuous ring-buffer pacer sending exact 20ms (160-byte) PCMU frames
+    # with monotonic clock drift compensation and ZERO mid-sentence silence padding.
     async def audio_sender_loop(s: CallSession):
         chunk_size = 160  # 20ms of 8kHz PCMU
+        pending = bytearray()
+        next_send_time: Optional[float] = None
         try:
             while not s.is_closing:
-                frame = await s.audio_out_queue.get()
-                if frame is None or s.is_closing:
-                    break
+                if s.clear_requested:
+                    pending.clear()
+                    next_send_time = None
+                    s.clear_requested = False
 
-                for i in range(0, len(frame), chunk_size):
-                    if s.is_closing:
+                # Fill buffer from queue
+                if len(pending) < chunk_size:
+                    try:
+                        timeout = 0.06 if len(pending) > 0 else None
+                        frame = await asyncio.wait_for(s.audio_out_queue.get(), timeout=timeout)
+                        if frame is None or s.is_closing:
+                            break
+                        if s.clear_requested:
+                            pending.clear()
+                            next_send_time = None
+                            s.clear_requested = False
+                            continue
+                        pending.extend(frame)
+                    except asyncio.TimeoutError:
+                        # Stream paused cleanly at end-of-turn: flush final partial <20ms tail
+                        if len(pending) > 0 and not s.clear_requested:
+                            chunk = bytes(pending).ljust(chunk_size, b"\xff")
+                            pending.clear()
+                            payload = base64.b64encode(chunk).decode("ascii")
+                            msg = {
+                                "event": "media",
+                                "stream_id": s.stream_id,
+                                "streamSid": s.stream_id,
+                                "media": {"payload": payload},
+                            }
+                            try:
+                                await websocket.send_text(json.dumps(msg))
+                            except Exception:
+                                break
+                        next_send_time = None
+                        continue
+
+                # Drain any additional queued frames non-blockingly so chunks stitch seamlessly
+                while not s.audio_out_queue.empty():
+                    try:
+                        extra = s.audio_out_queue.get_nowait()
+                        if extra is None:
+                            s.is_closing = True
+                            break
+                        pending.extend(extra)
+                    except asyncio.QueueEmpty:
                         break
-                    chunk = frame[i : i + chunk_size]
-                    if len(chunk) < chunk_size:
-                        chunk = chunk.ljust(chunk_size, b"\xff")
+
+                while len(pending) >= chunk_size and not s.is_closing:
+                    if s.clear_requested:
+                        pending.clear()
+                        next_send_time = None
+                        s.clear_requested = False
+                        break
+
+                    chunk = bytes(pending[:chunk_size])
+                    del pending[:chunk_size]
+
+                    now = time.monotonic()
+                    if next_send_time is None or (now - next_send_time) > 0.08:
+                        next_send_time = now
+                    delay = next_send_time - now
+                    if delay > 0.001:
+                        await asyncio.sleep(delay)
+                    next_send_time += 0.020
+
+                    if s.is_closing or s.clear_requested:
+                        continue
 
                     payload = base64.b64encode(chunk).decode("ascii")
                     msg = {
@@ -1044,8 +1358,8 @@ async def handle_media_stream(websocket: WebSocket):
                     try:
                         await websocket.send_text(json.dumps(msg))
                     except Exception:
+                        s.is_closing = True
                         break
-                    await asyncio.sleep(0.019)  # 20ms pacing cadence
         except asyncio.CancelledError:
             pass
 
@@ -1114,7 +1428,7 @@ async def handle_media_stream(websocket: WebSocket):
 
         logger.info(f"[CALL SESSION CONFIG] AI Answering | Allow Human Transfer: {allow_human_transfer}")
 
-        # Establish Gemini Live Session with Function Calling (Transfer Tool only if allowed)
+        # Establish Gemini Live Session with telephony-tuned VAD and Function Calling
         live_config = types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
             system_instruction=types.Content(parts=[types.Part(text=call_prompt)]),
@@ -1126,6 +1440,15 @@ async def handle_media_stream(websocket: WebSocket):
             tools=call_tools,
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=False,
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+                    prefix_padding_ms=300,
+                    silence_duration_ms=700,
+                )
+            ),
         )
 
         async with gemini_client.aio.live.connect(model=GEMINI_LIVE_MODEL, config=live_config) as live_ws:
@@ -1177,11 +1500,7 @@ async def handle_media_stream(websocket: WebSocket):
                                 if content.interrupted:
                                     logger.info("[BARGE-IN] Interruption detected by Gemini. Clearing audio buffer.")
                                     s.assistant_speaking = False
-                                    while not s.audio_out_queue.empty():
-                                        try:
-                                            s.audio_out_queue.get_nowait()
-                                        except asyncio.QueueEmpty:
-                                            break
+                                    s.clear_audio_output()
                                     clear_msg = {
                                         "event": "clear",
                                         "stream_id": s.stream_id,
@@ -1292,13 +1611,9 @@ async def handle_media_stream(websocket: WebSocket):
                                             }
 
                                         if part.inline_data and part.inline_data.data:
-                                            raw_24k = part.inline_data.data
-                                            samples_24k = np.frombuffer(raw_24k, dtype=np.int16)
-                                            # Resample 24kHz to 8000Hz (exact 3:1 decimation)
-                                            samples_8k = resample_24k_to_8k(samples_24k)
-                                            # Encode to G.711 mu-law bytes
-                                            ulaw_bytes = pcm16_to_ulaw(samples_8k)
-                                            await s.audio_out_queue.put(ulaw_bytes)
+                                            ulaw_bytes = s.dsp.outbound_pcm16_24k_to_ulaw(part.inline_data.data)
+                                            if ulaw_bytes:
+                                                await s.audio_out_queue.put(ulaw_bytes)
 
                         except asyncio.CancelledError:
                             break
@@ -1340,16 +1655,33 @@ async def handle_media_stream(websocket: WebSocket):
                     logger.info("[TELNYX] Handshake connected event received.")
 
                 elif event == "start":
-                    stream_id = data.get("stream_id") or data.get("streamSid") or data.get("start", {}).get("stream_id", "STR_DEFAULT")
                     start_meta = data.get("start", {})
-                    custom_params = start_meta.get("custom_parameters", {})
+                    stream_id = (
+                        data.get("stream_id")
+                        or data.get("streamSid")
+                        or start_meta.get("stream_id")
+                        or start_meta.get("streamSid")
+                        or "STR_DEFAULT"
+                    )
+                    custom_params = (
+                        start_meta.get("custom_parameters")
+                        or start_meta.get("customParameters")
+                        or {}
+                    )
                     call_sid = (
                         custom_params.get("call_sid")
                         or start_meta.get("call_sid")
+                        or start_meta.get("callSid")
                         or start_meta.get("call_control_id")
-                        or data.get("call_sid", "UNKNOWN_SID")
+                        or data.get("call_sid")
+                        or data.get("call_control_id")
+                        or "UNKNOWN_SID"
                     )
-                    caller_phone = custom_params.get("caller") or start_meta.get("from", "+1-Unknown")
+                    caller_phone = (
+                        custom_params.get("caller")
+                        or start_meta.get("from")
+                        or "+1-Unknown"
+                    )
 
                     session = CallSession(stream_id, call_sid, caller_phone, websocket)
                     logger.info(f"[TELNYX] Stream started: {stream_id} for Call SID: {call_sid}")
@@ -1374,57 +1706,73 @@ async def handle_media_stream(websocket: WebSocket):
                     if not b64_payload:
                         continue
 
-                    # Decode mu-law to 8kHz PCM16, resample to 16kHz
+                    # Stateful G.711 decode + 85Hz HPF + gentle AGC + click-free 16kHz upsampling
                     ulaw_bytes = base64.b64decode(b64_payload)
-                    pcm16_8k = ulaw_to_pcm16_8k(ulaw_bytes)
-                    pcm16_16k = resample_8k_to_16k(pcm16_8k)
+                    pcm16_16k, rms = session.dsp.inbound_ulaw_to_pcm16_16k(ulaw_bytes)
+                    if pcm16_16k.size == 0:
+                        continue
+                    frame_bytes = pcm16_16k.tobytes()
 
-                    # Check for barge-in or completion of greeting
+                    # Check for sustained barge-in or natural completion of opening greeting
                     if session.greeting_active:
+                        session.greeting_preroll.append(frame_bytes)
                         elapsed = time.time() - session.start_time
-                        rms = np.sqrt(np.mean(pcm16_16k.astype(np.float64) ** 2))
-                        # Caller interruptions after 1.5s grace period
-                        if elapsed > 1.5 and rms > 950:
+                        if elapsed > 0.8 and rms > 580:
+                            session.speech_frames_streak += 1
+                        else:
+                            session.speech_frames_streak = 0
+
+                        if session.speech_frames_streak >= 3:
                             logger.info("[BARGE-IN] Caller interrupted opening greeting.")
                             session.greeting_active = False
-                            while not session.audio_out_queue.empty():
-                                try:
-                                    session.audio_out_queue.get_nowait()
-                                except asyncio.QueueEmpty:
-                                    break
+                            session.speech_frames_streak = 0
+                            session.clear_audio_output()
                             await websocket.send_text(json.dumps({
                                 "event": "clear",
                                 "stream_id": session.stream_id,
                                 "streamSid": session.stream_id,
                             }))
+                            # Forward pre-roll frames so the caller's very first syllable is preserved
+                            for pre in session.greeting_preroll:
+                                inbound_buffer.extend(pre)
+                            session.greeting_preroll.clear()
+                            frame_bytes = b""
                         elif elapsed >= greeting_duration:
                             session.greeting_active = False
+                            session.greeting_preroll.clear()
 
-                    # If greeting finished, stream caller audio to Gemini
+                    # Continuous full-duplex audio streaming to Gemini Live (never starve VAD!)
                     if not session.greeting_active:
-                        rms = np.sqrt(np.mean(pcm16_16k.astype(np.float64) ** 2))
-                        # Suppress acoustic speaker echo during assistant speech unless caller interrupts
-                        if session.assistant_speaking and rms < 900:
-                            continue
-                        elif session.assistant_speaking and rms >= 900:
-                            logger.info("[BARGE-IN] Caller voice detected during assistant speech.")
-                            session.assistant_speaking = False
-                            while not session.audio_out_queue.empty():
-                                try:
-                                    session.audio_out_queue.get_nowait()
-                                except asyncio.QueueEmpty:
-                                    break
-                            await websocket.send_text(json.dumps({
-                                "event": "clear",
-                                "stream_id": session.stream_id,
-                                "streamSid": session.stream_id,
-                            }))
+                        if session.assistant_speaking:
+                            if rms >= 1050:
+                                session.bargein_frames_streak += 1
+                            else:
+                                session.bargein_frames_streak = 0
 
-                        inbound_buffer.extend(pcm16_16k.tobytes())
-                        # 100ms chunks (1600 samples = 3200 bytes)
-                        if len(inbound_buffer) >= 3200:
-                            chunk_to_send = bytes(inbound_buffer[:3200])
-                            inbound_buffer = inbound_buffer[3200:]
+                            if session.bargein_frames_streak >= 4:
+                                logger.info("[BARGE-IN] Caller voice detected during assistant speech.")
+                                session.assistant_speaking = False
+                                session.bargein_frames_streak = 0
+                                session.clear_audio_output()
+                                await websocket.send_text(json.dumps({
+                                    "event": "clear",
+                                    "stream_id": session.stream_id,
+                                    "streamSid": session.stream_id,
+                                }))
+                            elif rms < 420 and frame_bytes:
+                                # Gently attenuate quiet echo floor instead of dropping frames
+                                attenuated = (pcm16_16k.astype(np.float32) * 0.35).astype(np.int16)
+                                frame_bytes = attenuated.tobytes()
+                        else:
+                            session.bargein_frames_streak = 0
+
+                        if frame_bytes:
+                            inbound_buffer.extend(frame_bytes)
+
+                        # Stream 40ms frames (640 samples = 1280 bytes) for responsive VAD & ASR
+                        while len(inbound_buffer) >= 1280:
+                            chunk_to_send = bytes(inbound_buffer[:1280])
+                            del inbound_buffer[:1280]
                             await session.inbound_audio_queue.put(chunk_to_send)
 
                 elif event == "stop":
